@@ -21,7 +21,8 @@ const DEFAULT_SETTINGS = {
   reminder: true,
   theme: "light",
   glassOpacity: 0.82,
-  glassEnabled: false,
+  glassEnabled: true,
+  glassMigrated: false,
   chineseFont: "noto-sans",
   englishFont: "arial",
   fontStyle: "sans",
@@ -130,6 +131,7 @@ function loadState() {
       saved.records = saved.records || {};
       saved.daily = saved.daily || {};
       saved.settings = { ...DEFAULT_SETTINGS, ...(saved.settings || {}) };
+      if (!saved.settings.glassMigrated) { saved.settings.glassEnabled = true; saved.settings.glassMigrated = true; }
       saved.notes = saved.notes || {};
       saved.favoriteWords = saved.favoriteWords || [];
       saved.favoriteSentences = saved.favoriteSentences || [];
@@ -287,6 +289,7 @@ function normalizeState(saved) {
   saved.records = saved.records || {};
   saved.daily = saved.daily || {};
   saved.settings = { ...DEFAULT_SETTINGS, ...(saved.settings || {}) };
+  if (!saved.settings.glassMigrated) { saved.settings.glassEnabled = true; saved.settings.glassMigrated = true; }
   saved.notes = saved.notes || {};
   saved.favoriteWords = saved.favoriteWords || [];
   saved.favoriteSentences = saved.favoriteSentences || [];
