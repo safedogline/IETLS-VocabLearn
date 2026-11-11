@@ -111,6 +111,14 @@ function syncNativeGlass(enabled) {
   nativeGlassState = enabled;
   window.ipc?.postMessage(`glass:${enabled ? "on" : "off"}`);
 }
+function reportGlassState(tag) {
+  try {
+    const cs = getComputedStyle(document.body);
+    const shell = document.querySelector(".app-shell");
+    const info = shell ? ` shell=${getComputedStyle(shell).backgroundColor}` : " shell=missing";
+    window.ipc?.postMessage(`page-log:${tag} glass=${document.body.dataset.glass} enabled=${state.settings.glassEnabled} opacity=${state.settings.glassOpacity} bodyBg=${cs.backgroundColor}${info}`);
+  } catch (error) { window.ipc?.postMessage(`page-log:${tag} error=${error.message}`); }
+}
 document.addEventListener("keydown", event => {
   if (event.key === "Alt") window.__altDown = true;
 });
@@ -399,6 +407,7 @@ function applyTheme() {
   document.body.dataset.glassOpacity = String(Math.round(glassOpacity * 100));
   document.body.dataset.glass = glassOpacity === 0 ? "clear" : glassOpacity < 1 ? "on" : "off";
   syncNativeGlass(Boolean(state.settings.glassEnabled));
+  reportGlassState("applyTheme");
 }
 function applySidebar() {
   document.body.dataset.sidebar = sidebarCollapsed ? "collapsed" : "expanded";

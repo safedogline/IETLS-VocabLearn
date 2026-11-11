@@ -6,7 +6,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tao::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use tao::event::{Event, WindowEvent};
@@ -367,6 +367,35 @@ fn sync_webview_bounds(webview: &wry::WebView, width: u32, height: u32, scale: f
     });
 }
 
+#[cfg(windows)]
+fn apply_glass(hwnd: isize, enabled: bool, verbose: bool) {
+    unsafe {
+        const DWM_BB_ENABLE: u32 = 0x1;
+        const DWM_BB_BLURREGION: u32 = 0x2;
+        let region = CreateRectRgn(0, 0, -1, -1);
+        let blur = if enabled {
+            DwmBlurBehind {
+                flags: DWM_BB_ENABLE | DWM_BB_BLURREGION,
+                enabled: 1,
+                region,
+                transition_on_maximized: 0,
+            }
+        } else {
+            DwmBlurBehind {
+                flags: DWM_BB_ENABLE,
+                enabled: 0,
+                region,
+                transition_on_maximized: 0,
+            }
+        };
+        let result = DwmEnableBlurBehindWindow(hwnd, &blur);
+        DeleteObject(region);
+        if verbose || result != 0 {
+            log(&format!("glass toggle enabled={enabled} result={result}"));
+        }
+    }
+}
+
 fn main() -> wry::Result<()> {
     #[cfg(windows)]
     unsafe {
@@ -416,6 +445,9 @@ fn main() -> wry::Result<()> {
                             Some(WindowCommand::SetGlass(true))
                         } else if body == "glass:off" {
                             Some(WindowCommand::SetGlass(false))
+                        } else if body.starts_with("page-log:") {
+                            log(&format!("PAGE {}", &body[9..]));
+                            None
                         } else { match body.as_str() {
                             "window:minimize" => Some(WindowCommand::Minimize),
                             "window:maximize" => Some(WindowCommand::ToggleMaximize),
@@ -464,35 +496,39 @@ fn main() -> wry::Result<()> {
 
     let initial_size = window.inner_size();
     sync_webview_bounds(&webview, initial_size.width, initial_size.height, window.scale_factor());
+    let mut glass_on = false;
+    #[cfg(windows)]
+    let glass_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    #[cfg(windows)]
+    {
+        let hwnd = window.hwnd();
+        let flag = std::sync::Arc::clone(&glass_flag);
+        thread::spawn(move || {
+            loop {
+                thread::sleep(Duration::from_secs(2));
+                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    apply_glass(hwnd, true, false);
+                }
+            }
+        });
+    }
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
         match event {
             Event::UserEvent(WindowCommand::SetGlass(enabled)) => {
-                unsafe {
-                    use tao::platform::windows::WindowExtWindows;
-                    const DWM_BB_ENABLE: u32 = 0x1;
-                    const DWM_BB_BLURREGION: u32 = 0x2;
-                    let region = CreateRectRgn(0, 0, -1, -1);
-                    let blur = if enabled {
-                        DwmBlurBehind {
-                            flags: DWM_BB_ENABLE | DWM_BB_BLURREGION,
-                            enabled: 1,
-                            region,
-                            transition_on_maximized: 0,
-                        }
-                    } else {
-                        DwmBlurBehind {
-                            flags: DWM_BB_ENABLE,
-                            enabled: 0,
-                            region,
-                            transition_on_maximized: 0,
-                        }
-                    };
-                    let result = DwmEnableBlurBehindWindow(window.hwnd(), &blur);
-                    DeleteObject(region);
-                    log(&format!("glass toggle enabled={enabled} result={result}"));
-                }
+                glass_on = enabled;
+                glass_flag.store(enabled, std::sync::atomic::Ordering::Relaxed);
+                apply_glass(window.hwnd(), enabled, true);
+            }
+            // DWM blur-behind is flaky on Server 2022 / RDP: the call reports
+            // success but the visual effect can be dropped. Re-apply whenever
+            // the window gains focus or changes size so transparency heals itself.
+            Event::WindowEvent { event: WindowEvent::Focused(true), .. } if glass_on => {
+                apply_glass(window.hwnd(), true, false);
+            }
+            Event::WindowEvent { event: WindowEvent::Resized(_), .. } if glass_on => {
+                apply_glass(window.hwnd(), true, false);
             }
             Event::UserEvent(WindowCommand::Minimize) => window.set_minimized(true),
             Event::UserEvent(WindowCommand::ToggleMaximize) => {
