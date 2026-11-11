@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+set -u
+
+APP_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+PID_FILE="${XDG_RUNTIME_DIR:-/tmp}/vocablearn-http-server.pid"
+LOG_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/vocablearn/server.log"
+PORT="${VOCABLEARN_PORT:-4173}"
+URL="http://127.0.0.1:${PORT}"
+
+die() {
+  printf '%s\n' "$*" >&2
+  exit 1
+}
+
+check_deps() {
+  command -v curl >/dev/null 2>&1 || die "缺少 curl，请先安装：sudo apt install curl"
+
+  if command -v http-server >/dev/null 2>&1; then
+    SERVER_CMD="http-server"
+    return 0
+  fi
+
+  if command -v npx >/dev/null 2>&1; then
+    SERVER_CMD="npx --yes http-server"
+    return 0
+  fi
+
+  cat >&2 <<'EOF'
+缺少静态文件服务器，任选一种方式安装：
+
+  方式一（推荐，装 Node.js 后自带 npx）：
+    sudo apt install -y nodejs npm
+
+  方式二（直接用 Python，无需 Node.js）：
+    在本项目根目录执行：python3 -m http.server 4173 --bind 127.0.0.1
+
+安装 Node.js 后重新运行：./VocabLearn --start
+EOF
+  exit 1
+}
+
+running_pid() {
+  if [ -f "$PID_FILE" ]; then
+    pid=$(tr -d '[:space:]' < "$PID_FILE")
+    if [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null; then
+      printf '%s\n' "$pid"
+      return 0
+    fi
+    rm -f "$PID_FILE"
+  fi
+  return 1
+}
+
+start_server() {
+  if pid=$(running_pid); then
+    printf 'VocabLearn 已在后台运行，PID %s，地址 %s\n' "$pid" "$URL"
+    return 0
+  fi
+
+  if curl -fsS --max-time 1 "$URL/" >/dev/null 2>&1; then
+    printf '端口 %s 已被其他服务占用，未启动 VocabLearn\n' "$PORT" >&2
+    printf '可换个端口重试：VOCABLEARN_PORT=4180 ./VocabLearn --start\n' >&2
+    return 1
+  fi
+
+  check_deps
+  mkdir -p "$(dirname "$LOG_FILE")"
+
+  cd "$APP_DIR" || exit 1
+  nohup setsid $SERVER_CMD . -p "$PORT" -c-1 >>"$LOG_FILE" 2>&1 &
+  pid=$!
+  printf '%s\n' "$pid" > "$PID_FILE"
+
+  for _ in $(seq 1 30); do
+    if curl -fsS --max-time 1 "$URL/" >/dev/null 2>&1; then
+      printf 'VocabLearn 已启动，地址 %s，PID %s\n' "$URL" "$pid"
+      return 0
+    fi
+    sleep 0.2
+  done
+
+  printf 'VocabLearn 启动失败，请查看日志：%s\n' "$LOG_FILE" >&2
+  rm -f "$PID_FILE"
+  return 1
+}
+
+stop_server() {
+  if ! pid=$(running_pid); then
+    printf 'VocabLearn 当前未运行\n'
+    return 0
+  fi
+
+  kill -- -"$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+  for _ in $(seq 1 10); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      rm -f "$PID_FILE"
+      printf 'VocabLearn 已停止\n'
+      return 0
+    fi
+    sleep 0.2
+  done
+
+  kill -TERM -- -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+  rm -f "$PID_FILE"
+  printf 'VocabLearn 已发送停止信号，PID %s 仍可能正在退出\n' "$pid"
+}
+
+case "${1:-}" in
+  -S|--start)
+    start_server
+    ;;
+  -D|--down|--stop)
+    stop_server
+    ;;
+  *)
+    printf '用法: ./VocabLearn --start 启动；./VocabLearn --stop 停止\n' >&2
+    printf '换端口: VOCABLEARN_PORT=4180 ./VocabLearn --start\n' >&2
+    exit 2
+    ;;
+esac

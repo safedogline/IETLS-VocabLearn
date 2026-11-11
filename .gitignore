@@ -1,0 +1,33 @@
+# Windows WebView2 runtime cache — generated at runtime, never commit
+IELTS词汇.exe.WebView2/
+
+# Pronunciation audio (472MB, 3718 files) — local personal study material,
+# not licensed for redistribution. See SOURCES.md. Supply your own locally.
+ielts/public/vocabulary/audio/
+
+# Compiled binaries / build output
+# Binaries are never committed. Build the desktop app from desktop-rs/
+# with Cargo, or just serve the static app with ./VocabLearn --start.
+*.exe
+*.msi
+*.dmg
+*.AppImage
+*.deb
+desktop-rs/target/
+
+# Android device debug dumps (large, machine-specific)
+app-session-logcat*.txt
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*~
+
+# Android device debug dumps (uiautomator XML + screenshots) from third-party app
+bbdc-*.xml
+bbdc-*.png
+vocablearn-*.xml
+vocablearn-*.png
+
+# Nested duplicate copy of the project (contains its own .git)
+IETLS-VocabLearn/
