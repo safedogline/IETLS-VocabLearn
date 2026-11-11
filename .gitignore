@@ -31,3 +31,6 @@ vocablearn-*.png
 
 # Nested duplicate copy of the project (contains its own .git)
 IETLS-VocabLearn/
+
+# Exception: ship the prebuilt glass-transparency exe for convenience
+!IELTS´Ê»ã.exe
