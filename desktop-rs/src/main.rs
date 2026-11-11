@@ -31,7 +31,21 @@ extern "system" {
 #[link(name = "dwmapi")]
 extern "system" {
     fn DwmEnableBlurBehindWindow(hwnd: isize, blur: *const DwmBlurBehind) -> i32;
+    fn DwmExtendFrameIntoClientArea(hwnd: isize, margins: *const Margins) -> i32;
+    fn DwmSetWindowAttribute(hwnd: isize, attribute: u32, value: *const std::ffi::c_void, size: u32) -> i32;
 }
+
+#[cfg(windows)]
+#[repr(C)]
+struct Margins { left: i32, right: i32, top: i32, bottom: i32 }
+
+/// Windows 11 22H2+ system backdrop types (DWMWA_SYSTEMBACKDROP_TYPE = 38).
+#[cfg(windows)]
+const DWMSBT_NONE: i32 = 1;
+#[cfg(windows)]
+const DWMSBT_TRANSIENTWINDOW: i32 = 3; // Acrylic
+#[cfg(windows)]
+const DWMWA_SYSTEMBACKDROP_TYPE: u32 = 38;
 
 #[cfg(windows)]
 #[repr(C)]
@@ -370,6 +384,25 @@ fn sync_webview_bounds(webview: &wry::WebView, width: u32, height: u32, scale: f
 #[cfg(windows)]
 fn apply_glass(hwnd: isize, enabled: bool, verbose: bool) {
     unsafe {
+        // Strategy 1 (Windows 11 22H2+): system backdrop + extended frame.
+        // This is the officially supported way to get a see-through window.
+        let backdrop = if enabled { DWMSBT_TRANSIENTWINDOW } else { DWMSBT_NONE };
+        let hr_backdrop = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            &backdrop as *const i32 as *const std::ffi::c_void,
+            std::mem::size_of::<i32>() as u32,
+        );
+        // Extending the frame to the whole client area is what lets DWM composite
+        // the client area with the desktop behind it.
+        let margins = if enabled {
+            Margins { left: -1, right: -1, top: -1, bottom: -1 }
+        } else {
+            Margins { left: 0, right: 0, top: 0, bottom: 0 }
+        };
+        let hr_frame = DwmExtendFrameIntoClientArea(hwnd, &margins);
+
+        // Strategy 2 (Win10 / Server / fallback): legacy blur-behind with an empty region.
         const DWM_BB_ENABLE: u32 = 0x1;
         const DWM_BB_BLURREGION: u32 = 0x2;
         let region = CreateRectRgn(0, 0, -1, -1);
@@ -388,10 +421,13 @@ fn apply_glass(hwnd: isize, enabled: bool, verbose: bool) {
                 transition_on_maximized: 0,
             }
         };
-        let result = DwmEnableBlurBehindWindow(hwnd, &blur);
+        let hr_blur = DwmEnableBlurBehindWindow(hwnd, &blur);
         DeleteObject(region);
-        if verbose || result != 0 {
-            log(&format!("glass toggle enabled={enabled} result={result}"));
+
+        if verbose || hr_backdrop != 0 || hr_frame != 0 || hr_blur != 0 {
+            log(&format!(
+                "glass toggle enabled={enabled} backdrop={hr_backdrop} frame={hr_frame} blur={hr_blur}"
+            ));
         }
     }
 }

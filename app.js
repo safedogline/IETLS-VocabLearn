@@ -107,7 +107,9 @@ let databaseSaveTimer;
 let databaseSaveQueue = Promise.resolve();
 let nativeGlassState = null;
 function syncNativeGlass(enabled) {
-  if (nativeGlassState === enabled) return;
+  // Always push the state instead of trusting a cached flag: after the window is
+  // recreated or DWM drops the effect, a stale "already synced" value would
+  // silently skip the IPC and leave the window opaque.
   nativeGlassState = enabled;
   window.ipc?.postMessage(`glass:${enabled ? "on" : "off"}`);
 }
@@ -405,7 +407,7 @@ function applyTheme() {
   document.documentElement.style.setProperty("--glass-opacity", glassOpacity);
   document.documentElement.style.setProperty("--glass-alpha", `${Math.round(glassOpacity * 100)}%`);
   document.body.dataset.glassOpacity = String(Math.round(glassOpacity * 100));
-  document.body.dataset.glass = glassOpacity === 0 ? "clear" : glassOpacity < 1 ? "on" : "off";
+  document.body.dataset.glass = !state.settings.glassEnabled ? "off" : glassOpacity === 0 ? "clear" : "on";
   syncNativeGlass(Boolean(state.settings.glassEnabled));
   reportGlassState("applyTheme");
 }
@@ -1435,7 +1437,7 @@ document.addEventListener("input", event => {
     state.settings.glassOpacity = value / 100;
     document.documentElement.style.setProperty("--glass-opacity", state.settings.glassOpacity);
     document.documentElement.style.setProperty("--glass-alpha", `${value}%`);
-    document.body.dataset.glass = state.settings.glassEnabled ? (value === 0 ? "clear" : value < 100 ? "on" : "off") : "off";
+    document.body.dataset.glass = state.settings.glassEnabled ? (value === 0 ? "clear" : "on") : "off";
     document.body.dataset.glassOpacity = String(value);
     const output = document.querySelector("[data-glass-opacity-value]");
     if (output) output.value = `${value}%`;
