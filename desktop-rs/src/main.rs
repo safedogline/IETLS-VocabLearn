@@ -6,7 +6,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tao::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use tao::event::{Event, WindowEvent};
@@ -16,7 +16,18 @@ use tiny_http::{Header, Response, Server};
 use wry::{NewWindowResponse, WebViewBuilder};
 use rusqlite::{params, Connection};
 #[cfg(windows)]
-use tao::platform::windows::WindowExtWindows;
+use tao::platform::windows::{WindowBuilderExtWindows, WindowExtWindows};
+#[cfg(windows)]
+use windows::{
+    core::{IUnknown, Interface},
+    Win32::{
+        Foundation::HWND,
+        Graphics::DirectComposition::{DCompositionCreateDevice2, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual},
+        System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED},
+    },
+};
+#[cfg(windows)]
+use wry::WebViewBuilderExtWindows;
 
 #[cfg(windows)]
 #[link(name = "user32")]
@@ -28,34 +39,23 @@ extern "system" {
 }
 
 #[cfg(windows)]
-#[link(name = "dwmapi")]
-extern "system" {
-    fn DwmEnableBlurBehindWindow(hwnd: isize, blur: *const DwmBlurBehind) -> i32;
-    fn DwmExtendFrameIntoClientArea(hwnd: isize, margins: *const Margins) -> i32;
-    fn DwmSetWindowAttribute(hwnd: isize, attribute: u32, value: *const std::ffi::c_void, size: u32) -> i32;
+struct CompositionHost {
+    device: IDCompositionDevice,
+    _target: IDCompositionTarget,
+    visual: IDCompositionVisual,
 }
 
 #[cfg(windows)]
-#[repr(C)]
-struct Margins { left: i32, right: i32, top: i32, bottom: i32 }
-
-/// Windows 11 22H2+ system backdrop types (DWMWA_SYSTEMBACKDROP_TYPE = 38).
-#[cfg(windows)]
-const DWMSBT_NONE: i32 = 1;
-#[cfg(windows)]
-const DWMSBT_TRANSIENTWINDOW: i32 = 3; // Acrylic
-#[cfg(windows)]
-const DWMWA_SYSTEMBACKDROP_TYPE: u32 = 38;
-
-#[cfg(windows)]
-#[repr(C)]
-struct DwmBlurBehind { flags: u32, enabled: i32, region: isize, transition_on_maximized: i32 }
-
-#[cfg(windows)]
-#[link(name = "gdi32")]
-extern "system" {
-    fn CreateRectRgn(left: i32, top: i32, right: i32, bottom: i32) -> isize;
-    fn DeleteObject(object: isize) -> i32;
+fn create_composition_host(hwnd: isize) -> windows::core::Result<CompositionHost> {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let device: IDCompositionDevice = DCompositionCreateDevice2(None::<&IUnknown>)?;
+        let target = device.CreateTargetForHwnd(HWND(hwnd as *mut _), true)?;
+        let visual = device.CreateVisual()?;
+        target.SetRoot(&visual)?;
+        device.Commit()?;
+        Ok(CompositionHost { device, _target: target, visual })
+    }
 }
 
 #[derive(Debug)]
@@ -381,57 +381,6 @@ fn sync_webview_bounds(webview: &wry::WebView, width: u32, height: u32, scale: f
     });
 }
 
-#[cfg(windows)]
-fn apply_glass(hwnd: isize, enabled: bool, verbose: bool) {
-    unsafe {
-        // Strategy 1 (Windows 11 22H2+): system backdrop + extended frame.
-        // This is the officially supported way to get a see-through window.
-        let backdrop = if enabled { DWMSBT_TRANSIENTWINDOW } else { DWMSBT_NONE };
-        let hr_backdrop = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_SYSTEMBACKDROP_TYPE,
-            &backdrop as *const i32 as *const std::ffi::c_void,
-            std::mem::size_of::<i32>() as u32,
-        );
-        // Extending the frame to the whole client area is what lets DWM composite
-        // the client area with the desktop behind it.
-        let margins = if enabled {
-            Margins { left: -1, right: -1, top: -1, bottom: -1 }
-        } else {
-            Margins { left: 0, right: 0, top: 0, bottom: 0 }
-        };
-        let hr_frame = DwmExtendFrameIntoClientArea(hwnd, &margins);
-
-        // Strategy 2 (Win10 / Server / fallback): legacy blur-behind with an empty region.
-        const DWM_BB_ENABLE: u32 = 0x1;
-        const DWM_BB_BLURREGION: u32 = 0x2;
-        let region = CreateRectRgn(0, 0, -1, -1);
-        let blur = if enabled {
-            DwmBlurBehind {
-                flags: DWM_BB_ENABLE | DWM_BB_BLURREGION,
-                enabled: 1,
-                region,
-                transition_on_maximized: 0,
-            }
-        } else {
-            DwmBlurBehind {
-                flags: DWM_BB_ENABLE,
-                enabled: 0,
-                region,
-                transition_on_maximized: 0,
-            }
-        };
-        let hr_blur = DwmEnableBlurBehindWindow(hwnd, &blur);
-        DeleteObject(region);
-
-        if verbose || hr_backdrop != 0 || hr_frame != 0 || hr_blur != 0 {
-            log(&format!(
-                "glass toggle enabled={enabled} backdrop={hr_backdrop} frame={hr_frame} blur={hr_blur}"
-            ));
-        }
-    }
-}
-
 fn main() -> wry::Result<()> {
     #[cfg(windows)]
     unsafe {
@@ -451,8 +400,15 @@ fn main() -> wry::Result<()> {
     let mut window_builder = WindowBuilder::new()
         .with_title(APP_TITLE)
         .with_transparent(true)
+        .with_decorations(false)
         .with_resizable(true)
         .with_min_inner_size(LogicalSize::new(MIN_WIDTH, MIN_HEIGHT));
+    #[cfg(windows)]
+    {
+        window_builder = window_builder
+            .with_no_redirection_bitmap(true)
+            .with_undecorated_shadow(false);
+    }
     if let Ok(icon) = tao::window::Icon::from_rgba(include_bytes!("../icon.rgba").to_vec(), 64, 64) {
         window_builder = window_builder.with_window_icon(Some(icon));
     }
@@ -463,6 +419,8 @@ fn main() -> wry::Result<()> {
         None => window_builder.with_inner_size(default_window_size(&event_loop)),
     };
     let window = window_builder.build(&event_loop).expect("failed to create window");
+    #[cfg(windows)]
+    let composition_host = create_composition_host(window.hwnd()).expect("failed to create DirectComposition host");
     let webview = if let Some(root) = find_root() {
         match start_server(root.clone(), database_path()) {
             Ok(port) => {
@@ -471,7 +429,7 @@ fn main() -> wry::Result<()> {
                 let url = format!("{origin}/index.html");
                 let origin_for_nav = origin.clone();
                 let glass_proxy = event_proxy.clone();
-                WebViewBuilder::new()
+                let builder = WebViewBuilder::new()
                     .with_url(&url)
                     .with_transparent(true)
                     .with_background_color((0, 0, 0, 0))
@@ -511,60 +469,48 @@ fn main() -> wry::Result<()> {
                             open_external(&target);
                         }
                         NewWindowResponse::Deny
-                    })
-                    .build(&window)?
+                    });
+                #[cfg(windows)]
+                let builder = builder.with_composition_visual_target(composition_host.visual.cast()?);
+                builder.build(&window)?
             }
             Err(error) => {
                 log(&format!("server error: {error}"));
-                WebViewBuilder::new()
+                let builder = WebViewBuilder::new()
                     .with_html(error_page("本地服务启动失败，请重新打开程序。"))
-                    .build(&window)?
+                    .with_transparent(true)
+                    .with_background_color((0, 0, 0, 0));
+                #[cfg(windows)]
+                let builder = builder.with_composition_visual_target(composition_host.visual.cast()?);
+                builder.build(&window)?
             }
         }
     } else {
         log("web root not found");
-        WebViewBuilder::new()
+        let builder = WebViewBuilder::new()
             .with_html(error_page(
                 "未找到学习资料。请把本程序放在包含 index.html、app.js 和 ielts 文件夹的目录中，不要单独移动 exe。",
             ))
-            .build(&window)?
+            .with_transparent(true)
+            .with_background_color((0, 0, 0, 0));
+        #[cfg(windows)]
+        let builder = builder.with_composition_visual_target(composition_host.visual.cast()?);
+        builder.build(&window)?
     };
+
+    #[cfg(windows)]
+    unsafe {
+        composition_host.device.Commit()?;
+        composition_host.device.WaitForCommitCompletion()?;
+    }
 
     let initial_size = window.inner_size();
     sync_webview_bounds(&webview, initial_size.width, initial_size.height, window.scale_factor());
-    let mut glass_on = false;
-    #[cfg(windows)]
-    let glass_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    #[cfg(windows)]
-    {
-        let hwnd = window.hwnd();
-        let flag = std::sync::Arc::clone(&glass_flag);
-        thread::spawn(move || {
-            loop {
-                thread::sleep(Duration::from_secs(2));
-                if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                    apply_glass(hwnd, true, false);
-                }
-            }
-        });
-    }
-
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
         match event {
             Event::UserEvent(WindowCommand::SetGlass(enabled)) => {
-                glass_on = enabled;
-                glass_flag.store(enabled, std::sync::atomic::Ordering::Relaxed);
-                apply_glass(window.hwnd(), enabled, true);
-            }
-            // DWM blur-behind is flaky on Server 2022 / RDP: the call reports
-            // success but the visual effect can be dropped. Re-apply whenever
-            // the window gains focus or changes size so transparency heals itself.
-            Event::WindowEvent { event: WindowEvent::Focused(true), .. } if glass_on => {
-                apply_glass(window.hwnd(), true, false);
-            }
-            Event::WindowEvent { event: WindowEvent::Resized(_), .. } if glass_on => {
-                apply_glass(window.hwnd(), true, false);
+                log(&format!("glass page state enabled={enabled} composition=true"));
             }
             Event::UserEvent(WindowCommand::Minimize) => window.set_minimized(true),
             Event::UserEvent(WindowCommand::ToggleMaximize) => {

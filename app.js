@@ -407,7 +407,7 @@ function applyTheme() {
   document.documentElement.style.setProperty("--glass-opacity", glassOpacity);
   document.documentElement.style.setProperty("--glass-alpha", `${Math.round(glassOpacity * 100)}%`);
   document.body.dataset.glassOpacity = String(Math.round(glassOpacity * 100));
-  document.body.dataset.glass = !state.settings.glassEnabled ? "off" : glassOpacity === 0 ? "clear" : "on";
+  document.body.dataset.glass = !state.settings.glassEnabled || glassOpacity === 1 ? "off" : glassOpacity === 0 ? "clear" : "on";
   syncNativeGlass(Boolean(state.settings.glassEnabled));
   reportGlassState("applyTheme");
 }
@@ -1437,7 +1437,7 @@ document.addEventListener("input", event => {
     state.settings.glassOpacity = value / 100;
     document.documentElement.style.setProperty("--glass-opacity", state.settings.glassOpacity);
     document.documentElement.style.setProperty("--glass-alpha", `${value}%`);
-    document.body.dataset.glass = state.settings.glassEnabled ? (value === 0 ? "clear" : "on") : "off";
+    document.body.dataset.glass = !state.settings.glassEnabled || value === 100 ? "off" : value === 0 ? "clear" : "on";
     document.body.dataset.glassOpacity = String(value);
     const output = document.querySelector("[data-glass-opacity-value]");
     if (output) output.value = `${value}%`;
