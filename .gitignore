@@ -34,3 +34,7 @@ IETLS-VocabLearn/
 
 # Exception: ship the prebuilt glass-transparency exe for convenience
 !IELTS´Ê»ã.exe
+
+# MemSearch agent memory store (local session notes)
+.memsearch/
+
