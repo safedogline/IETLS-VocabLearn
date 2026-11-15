@@ -70,7 +70,7 @@ python3 -m http.server 4173 --bind 127.0.0.1
 
 ### 想要原生窗口（可选）
 
-`desktop-rs/` 里是 Rust + WebView 的桌面壳，多一个本地窗口和 SQLite 存储。需要先装 Rust：
+`desktop-rs/` 里是 Rust + WebView 的桌面壳，多一个本地窗口和 SQLite 存储。透明窗口的实现在这一层（见下面「透明窗口是怎么做的」）。需要先装 Rust：
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -84,13 +84,35 @@ sudo apt install -y build-essential pkg-config \
   libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev
 ```
 
-然后：
+然后编译（Windows 还需要 WebView2 运行时，Win11 自带）：
 
 ```bash
 cd desktop-rs && cargo build --release
 ```
 
-产物在 `desktop-rs/target/release/`。仓库里不放在任何编译好的二进制，`.exe`、`.msi`、`.AppImage` 都在忽略列表里。
+产物在 `desktop-rs/target/release/`。
+
+仓库根目录的 `IELTS词汇.exe` 是作者用同一份源码预编译的版本，方便免装 Rust 直接用；
+其余二进制（`*.exe`、`*.msi`、`*.AppImage`）都在 `.gitignore` 里，不会提交。
+
+## 桌面窗口
+
+桌面版没有系统标题栏，所以窗口顶部有一条 30 px 高的自绘按钮条：左右两端分别是 `⠿` 拖动区和 `–` `□` `×` 三个按钮。
+按钮条只在桌面壳里出现（页面检测到 `window.ipc` 才加 `body[data-native]`），浏览器打开时完全不占位；拖动区的图标平时是淡的，鼠标移上去才显形。
+不想用鼠标时，按住 `Alt` 拖动页面任意位置也能移动窗口；在「设置 → 窗口操作」里同样能最小化、最大化和关闭。
+窄窗口（≤640 px）下按钮条仍然覆盖在顶部，所以侧栏会整体下移 30 px，导航图标不会被按钮条压住。
+关闭窗口时会记住大小和位置，下次打开原样恢复；如果记住的位置已经不在任何显示器上（比如拔掉外接显示器），会自动移回主屏幕并写日志。
+
+### 透明窗口是怎么做的
+
+四层配合，缺一不可：
+
+1. **CSS 分层半透明**：`body[data-glass="on"]` 用 `color-mix(in srgb, var(--bg) var(--glass-alpha), transparent)` 把底色按透明度混成半透明，卡片、侧栏再各自叠一层。`--glass-alpha` 由设置里的滑块驱动。
+2. **窗口不绘制任何东西**：`.with_no_redirection_bitmap(true)` 去掉窗口的重定向位图（`WS_EX_NOREDIRECTIONBITMAP`），桌面于是能直接透过来。
+3. **不能用 DWM**：WebView2 会渲染进自己那个不透明的子窗口，`DwmEnableBlurBehindWindow` 之类的系统毛玻璃永远看不到网页内容——历史上的三次尝试都返回 `S_OK` 但毫无效果。
+4. **DirectComposition 托管**：`desktop-rs/vendor/` 里有一份改过的 wry，用 `CreateCoreWebView2CompositionController` 把网页托管到一个 `IDCompositionVisual` 上，窗口在 Win32 消息里接收输入再转交给它。
+
+所以 `desktop-rs/vendor/wry-*` 这个目录必须留在仓库里，也不能换成 crates.io 上的 wry：上游至今没有 composition 支持。
 
 ## 日常命令
 
@@ -114,7 +136,8 @@ app.js          学习流程、词库加载、记录、备份
 styles.css      主题和响应式布局
 VocabLearn      启停脚本
 ielts/          词库、音标、听力、阅读、写作数据
-desktop-rs/     桌面壳（Rust）
+desktop-rs/     桌面壳（Rust），vendor/ 里是改过的 wry
+tests/          界面快照回归（dom-shim.mjs + regress.mjs）
 docs/           截图
 ```
 
@@ -123,6 +146,8 @@ docs/           截图
 浏览器里用 `localStorage` 存进度和设置，IndexedDB 存一份镜像备份——万一把浏览器数据清了，重开还能从 IndexedDB 找回来。桌面版还会写一份到本地 SQLite。
 
 想换电脑或者留个底，首页「导出备份」导成 JSON。
+
+桌面版的 SQLite 文件在 `%APPDATA%\IELTS-Vocabulary\study.sqlite`，窗口位置记在同目录的 `window.json`，运行日志是同目录的 `main.log`（超过 512 KB 自动轮转成 `main.log.1`）。
 
 ## 导入自己的词书
 
@@ -138,5 +163,11 @@ JSON 可以是纯数组，也可以是带 `name` 和 `words` 的对象。除了�
 
 ```bash
 node --check app.js
-git diff --check
+node --experimental-vm-modules tests/regress.mjs check tests/snapshots/baseline
 ```
+
+第二条是界面快照回归：`tests/dom-shim.mjs` 用一个零依赖的 DOM 替身把 `app.js` 跑起来（真的读 `ielts/` 里的数据），
+再把 10 个视图 × 3 套主题共 51 份 HTML 快照和基线逐字节比对。改了模板又不想改坏界面时，这条能立刻告诉你哪一页变了。
+
+`--experimental-vm-modules` 不能省：词库是动态 `import()` 进来的，缺这个开关会直接报 `ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING_FLAG`。
+确实要更新基线时，把 `check` 换成 `out` 重跑一次。

@@ -1,11 +1,10 @@
-﻿const STORAGE_KEY = "cixu-desktop-v1";
+const STORAGE_KEY = "cixu-desktop-v1";
 const BACKUP_DB = "cixu-progress-backup";
 const BACKUP_STORE = "state";
 const STATE_API = "./__ielts_state";
 const DAY = 86400000;
 const IELTS_BOOK_ID = "ielts-zhenjing-local";
 const DEFAULT_SETTINGS = {
-  dailyNew: 20,
   groupSize: 20,
   globalFontSize: 0,
   vocabularyStart: 1,
@@ -18,14 +17,12 @@ const DEFAULT_SETTINGS = {
   confuseAnalyze: true,
   listeningQuiz: false,
   showSyllableMarks: true,
-  reminder: true,
   theme: "light",
   glassOpacity: 0.82,
   glassEnabled: true,
   glassMigrated: false,
   chineseFont: "noto-sans",
   englishFont: "arial",
-  fontStyle: "sans",
   followSystem: false,
   mnemonicOrder: ["phrase", "variant", "root", "derive", "note", "synonym"],
 };
@@ -105,12 +102,10 @@ let sidebarCollapsed = localStorage.getItem("cixu-sidebar") === "1";
 let databaseAvailable = false;
 let databaseSaveTimer;
 let databaseSaveQueue = Promise.resolve();
-let nativeGlassState = null;
 function syncNativeGlass(enabled) {
   // Always push the state instead of trusting a cached flag: after the window is
   // recreated or DWM drops the effect, a stale "already synced" value would
   // silently skip the IPC and leave the window opaque.
-  nativeGlassState = enabled;
   window.ipc?.postMessage(`glass:${enabled ? "on" : "off"}`);
 }
 function reportGlassState(tag) {
@@ -128,8 +123,16 @@ document.addEventListener("keyup", event => {
   if (event.key === "Alt") window.__altDown = false;
 });
 window.addEventListener("blur", () => { window.__altDown = false; });
+// The desktop shell is frameless, so dragging needs an explicit trigger. The
+// grip in the window bar covers the ordinary case; holding Alt over any page
+// content keeps working as the original shortcut.
+// Must be mousedown, not click: the Rust side answers with
+// WM_NCLBUTTONDOWN/HTCAPTION, whose modal loop starts immediately and ends on
+// button release, so a click would only arrive after the drag is over.
 document.addEventListener("mousedown", event => {
-  if (event.button === 0 && window.__altDown) window.ipc?.postMessage("window:drag");
+  if (event.button !== 0) return;
+  if (event.target.closest('[data-window="drag"]')) { event.preventDefault(); window.ipc?.postMessage("window:drag"); return; }
+  if (window.__altDown) window.ipc?.postMessage("window:drag");
 });
 
 function loadState() {
@@ -182,8 +185,11 @@ async function loadIeltsBook(attempt = 0) {
       category,
       groupNumber: groupIndex + 1,
       groupPosition: wordIndex + 1,
-      groupWords: group.map(entry => entry.word.join(" / ")),
-      audio: `/ielts/public/vocabulary/audio/${encodeURIComponent(category)}/${encodeURIComponent(item.word[0])}.mp3`,
+      // `groupWords` is deliberately NOT stored: it is identical for every word
+      // in a group and costs ~147 KB of the 1.48 MB book payload. groupWordsOf()
+      // rebuilds it from category+groupNumber on demand. Same for `audio`:
+      // the referenced mp3 files are not distributed, so the path is derived in
+      // wordAudioPath() instead of being written 3674 times (~300 KB).
     }))));
     if (!words.length) return;
     const book = { id: IELTS_BOOK_ID, name: "雅思词汇真经", category: "22 个主题", createdAt: 0, words };
@@ -327,22 +333,75 @@ function getRecord(bookId, word) {
 }
 function isKnown(word, bookId = bookIdFor(word)) { return Boolean(state.known[recordKey(bookId, word)]); }
 function likeCount(word, bookId = bookIdFor(word)) { return state.likes[recordKey(bookId, word)] || 0; }
+// A book's words, indexed by lowercased spelling. Rebuilt lazily per book object
+// and cached in a WeakMap, so replacing or deleting a book invalidates the index
+// automatically. Without this, dueWords() and collocationsOf() did a linear
+// `words.find()` inside another linear loop (O(n^2) over 3674 words).
+const wordLookup = new WeakMap();
+function wordIndex(book) {
+  if (!book || !Array.isArray(book.words)) return new Map();
+  let index = wordLookup.get(book);
+  if (!index) {
+    index = new Map();
+    for (const word of book.words) {
+      const key = String(word.word).toLowerCase();
+      // First occurrence wins, matching the `find()` semantics this replaces.
+      if (!index.has(key)) index.set(key, word);
+    }
+    wordLookup.set(book, index);
+  }
+  return index;
+}
 function findWord(text, bookId = currentBookId) {
-  return state.books.find(book => book.id === bookId)?.words.find(word => word.word.toLowerCase() === String(text).toLowerCase());
+  return wordIndex(state.books.find(book => book.id === bookId)).get(String(text).toLowerCase());
 }
 function dueWords(bookId = currentBookId) {
   const now = Date.now();
-  return (state.reviews[bookId] || []).map(item => ({ item, word: state.books.find(book => book.id === bookId)?.words.find(word => word.word.toLowerCase() === item.word) })).filter(entry => entry.word && entry.item.dueAt <= now && !isKnown(entry.word, bookId)).sort((a, b) => a.item.dueAt - b.item.dueAt);
+  const index = wordIndex(state.books.find(book => book.id === bookId));
+  return (state.reviews[bookId] || []).map(item => ({ item, word: index.get(String(item.word).toLowerCase()) })).filter(entry => entry.word && entry.item.dueAt <= now && !isKnown(entry.word, bookId)).sort((a, b) => a.item.dueAt - b.item.dueAt);
 }
 function bookStats(book) {
-  const records = book.words.map(word => getRecord(book.id, word));
+  // Read records directly instead of calling getRecord(), which minted an empty
+  // record for every word and bloated both state.records and every saved payload.
+  const records = book.words.map(word => state.records[recordKey(book.id, word)]).filter(Boolean);
   const known = book.words.filter(word => isKnown(word, book.id)).length;
   const learned = records.filter(record => record.box > 0).length;
   const due = dueWords(book.id).length;
   const introducedToday = records.filter(record => record.introducedAt && new Date(record.introducedAt).toDateString() === new Date().toDateString()).length;
-  return { learned, due, introducedToday, known, records };
+  return { learned, due, introducedToday, known };
 }
 function allDue() { return state.books.reduce((sum, book) => sum + dueWords(book.id).length, 0); }
+// The word's group (the textbook cluster it came from). Stored books may carry
+// `groupWords` directly (imported reading books do); the built-in IELTS book does
+// not, so the group is reconstructed once per book from category + groupNumber.
+const groupLookup = new WeakMap();
+function groupWordsOf(word) {
+  if (Array.isArray(word?.groupWords)) return word.groupWords;
+  if (!word || !word.groupNumber) return [];
+  const book = state.books.find(item => item.id === bookIdFor(word));
+  if (!book) return [];
+  let groups = groupLookup.get(book);
+  if (!groups) {
+    groups = new Map();
+    for (const entry of book.words) {
+      if (!entry.groupNumber) continue;
+      const key = `${entry.category}|${entry.groupNumber}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(entry.word);
+    }
+    groupLookup.set(book, groups);
+  }
+  return groups.get(`${word.category}|${word.groupNumber}`) || [];
+}
+// Audio for the built-in wordbook: the theme-level mp3 files are not
+// redistributed with this project, so this path normally 404s and playAudio()
+// falls back to speech synthesis. Derived rather than stored (see loadIeltsBook).
+function wordAudioPath(word) {
+  if (word?.audio) return word.audio;
+  if (!word?.category) return "";
+  const head = String(word.word).split(" / ")[0];
+  return `/ielts/public/vocabulary/audio/${encodeURIComponent(word.category)}/${encodeURIComponent(head)}.mp3`;
+}
 function todayStats() { return state.daily[todayKey()] || { learned: 0, reviewed: 0, seconds: 0 }; }
 function totalMinutes() { return Math.round(Object.values(state.daily).reduce((sum, day) => sum + (day.seconds || 0), 0) / 60); }
 function masteredCount() { return Object.values(state.records).filter(record => record.box >= 3).length + Object.keys(state.known).length; }
@@ -388,10 +447,38 @@ function parseImport(text, fileName) {
   const records = rows.slice(hasHeader ? 1 : 0).map(row => Object.fromEntries(headers.map((header, index) => [header, row[index] || ""])));
   return { name: fileName.replace(/\.[^.]+$/, ""), words: records.map(normalizeWord) };
 }
+// Import guard rails: the file picker accepts arbitrary user files, so every
+// field is bounded before it enters state and reaches localStorage.
+const MAX_IMPORT_WORDS = 20000;
+const MAX_FIELD_CHARS = 2000;
+const MAX_BOOKS = 60;
+const MAX_JSON_BYTES = 32 * 1024 * 1024;
+function clampText(value) {
+  return String(value ?? "").trim().slice(0, MAX_FIELD_CHARS);
+}
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
 function normalizeWord(item) {
-  if (!item || typeof item !== "object" || Array.isArray(item)) return null;
-  const get = (...keys) => { for (const key of keys) if (item[key] != null && String(item[key]).trim()) return String(item[key]).trim(); return ""; };
-  return { word: get("word", "term", "headword", "单词", "词条", "英文"), meaning: get("meaning", "definition", "translation", "释义", "中文", "意思"), example: get("example", "sentence", "例句"), exampleTranslation: get("exampleTranslation", "example_translation", "translationExample", "例句翻译"), syllables: get("syllables", "syllable", "音节"), translation: get("meaning", "definition", "translation", "释义", "中文", "意思"), phonetic: get("phonetic", "pronunciation", "音标"), audio: get("audio", "audioUrl", "audio_url", "发音"), category: get("category", "group", "unit", "分类", "单元") };
+  if (!isPlainObject(item)) return null;
+  const get = (...keys) => { for (const key of keys) { const text = clampText(item[key]); if (text) return text; } return ""; };
+  const meaning = get("meaning", "definition", "translation", "释义", "中文", "意思");
+  const phonetic = get("phonetic", "pronunciation", "音标");
+  const audio = get("audio", "audioUrl", "audio_url", "发音");
+  const category = get("category", "group", "unit", "分类", "单元");
+  const exampleTranslation = get("exampleTranslation", "example_translation", "translationExample", "例句翻译");
+  return {
+    word: get("word", "term", "headword", "单词", "词条", "英文"),
+    meaning,
+    example: get("example", "sentence", "例句"),
+    exampleTranslation,
+    syllables: get("syllables", "syllable", "音节"),
+    // Imported files only carry one Chinese gloss, so both fields share it.
+    translation: meaning,
+    phonetic,
+    audio,
+    category,
+  };
 }
 function applyTheme() {
   const theme = state.settings.followSystem ? (window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "deep" : "light") : state.settings.theme;
@@ -419,6 +506,15 @@ function applySidebar() {
     button.title = sidebarCollapsed ? "展开侧栏" : "收起侧栏";
     button.setAttribute("aria-label", button.title);
   }
+}
+// True only inside the desktop shell, which exposes window.ipc. The browser
+// build must not gain the window bar (it would overlap the normal page).
+function isNativeShell() {
+  return Boolean(window.ipc?.postMessage);
+}
+function applyNativeChrome() {
+  if (isNativeShell()) document.body.dataset.native = "on";
+  else delete document.body.dataset.native;
 }
 function renderShell() {
   document.querySelectorAll(".nav-item").forEach(button => button.classList.toggle("active", button.dataset.view === currentView));
@@ -457,14 +553,82 @@ function renderHome() {
   const scopedWords = wordsForScope(book, settings.vocabularyCategory);
   const scopeOptions = categories.map(category => `<option value="${escapeHtml(category)}" ${settings.vocabularyCategory === category ? "selected" : ""}>${escapeHtml(category)}</option>`).join("");
   const scopeMatches = scopeSearchQuery.trim() ? book.words.map((word, index) => ({ word, index })).filter(({ word }) => `${word.word} ${word.meaning || ""}`.toLowerCase().includes(scopeSearchQuery.trim().toLowerCase())).slice(0, 8) : [];
+  const metrics = [
+    ["今日新学", daily.learned, "词", "今天累计"],
+    ["待复习", allDue(), "词", "到期词条"],
+    ["今日时长", Math.round((daily.seconds || 0) / 60), "分", `累计 ${totalMinutes()} 分钟`],
+    ["累计掌握", masteredCount(), "词", "含已标熟"],
+  ].map(([label, value, unit, note]) => `<div class="metric"><div class="metric-label">${label}</div><div class="metric-value">${value}<span class="metric-unit">${unit}</span></div><div class="metric-note">${note}</div></div>`).join("");
+  const heading = `<div class="page-heading"><div><p class="eyebrow">${new Intl.DateTimeFormat("zh-CN", { weekday: "long", month: "long", day: "numeric" }).format(new Date())}</p><h1>今天，继续积累</h1></div><div class="date-label">本地学习记录</div></div>`;
+  const bookSummary = renderBookSummary(book, stats, percent, fresh);
   document.getElementById("view-home").innerHTML = `
-    <div class="page-heading"><div><p class="eyebrow">${new Intl.DateTimeFormat("zh-CN", { weekday: "long", month: "long", day: "numeric" }).format(new Date())}</p><h1>今天，继续积累</h1></div><div class="date-label">本地学习记录</div></div>
-    <div class="overview-grid"><div class="metric"><div class="metric-label">今日新学</div><div class="metric-value">${daily.learned}<span class="metric-unit">词</span></div><div class="metric-note">今天累计</div></div><div class="metric"><div class="metric-label">待复习</div><div class="metric-value">${allDue()}<span class="metric-unit">词</span></div><div class="metric-note">到期词条</div></div><div class="metric"><div class="metric-label">今日时长</div><div class="metric-value">${Math.round((daily.seconds || 0) / 60)}<span class="metric-unit">分</span></div><div class="metric-note">累计 ${totalMinutes()} 分钟</div></div><div class="metric"><div class="metric-label">累计掌握</div><div class="metric-value">${masteredCount()}<span class="metric-unit">词</span></div><div class="metric-note">含已标熟</div></div></div>
+    ${heading}
+    <div class="overview-grid">${metrics}</div>
     <div class="section-heading"><h2>当前词书</h2><button class="quiet-link" data-view="words">管理词书 →</button></div>
-     <div class="book-summary"><div class="book-cover">${escapeHtml(book.name.slice(0, 1))}</div><div class="book-summary-main"><div class="book-summary-title">${escapeHtml(book.name)}</div><div class="book-summary-sub">${book.words.length} 个词条 · ${escapeHtml(book.category || "自定义词书")}${stats.known ? ` · 已标熟 ${stats.known}` : ""}</div><div class="progress-track"><div class="progress-fill" style="width:${percent}%"></div></div></div><div class="summary-progress">${stats.learned + stats.known} / ${book.words.length}</div><div class="summary-actions"><button class="primary-button" data-action="${session ? "resume-session" : "start-from-scope"}" ${fresh === 0 && session?.mode !== "review" ? "disabled" : ""}>${session?.mode === "review" ? "继续复习" : "继续学习"}</button><button class="secondary-button" data-action="start-review" ${stats.due || session?.mode === "review" ? "" : "disabled"}>${session?.mode === "review" ? "继续复习" : `复习 ${stats.due || ""}`}</button><button class="secondary-button" data-view="settings">计划</button></div></div>
-      <section class="study-panel scope-panel"><div class="study-panel-header"><span>选择学习起点</span><span class="pill">仅影响新词</span></div><div class="scope-controls"><label class="scope-start-label">从第几个词开始<span class="number-stepper"><input type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="off" maxlength="${String(scopedWords.length || 1).length}" value="${Math.min(settings.vocabularyStart || 1, scopedWords.length || 1)}" data-scope="vocabularyStart" aria-label="从第几个词开始"><span class="stepper-buttons"><button type="button" data-step="1" aria-label="增加起始词">+</button><button type="button" data-step="-1" aria-label="减少起始词">−</button></span></span><span class="scope-word-preview" id="scope-word-preview">${escapeHtml(scopedWords[Math.min(settings.vocabularyStart || 1, scopedWords.length || 1) - 1]?.word || "超出主题范围")}</span></label><label class="scope-category-label">主题<select class="setting-select scope-select" data-scope="vocabularyCategory"><option value="all" ${settings.vocabularyCategory === "all" ? "selected" : ""}>全部主题</option>${scopeOptions}</select></label><span class="scope-count">${settings.vocabularyCategory === "all" ? "共" : "主题内共"} ${scopedWords.length} 个词条</span><button class="primary-button scope-start-button" data-action="start-from-scope" ${scopedWords.length ? "" : "disabled"}>开始学习</button></div><div class="scope-search"><input type="search" class="scope-search-input" data-scope-search placeholder="搜索单词或释义" value="${escapeHtml(scopeSearchQuery)}" aria-label="搜索学习起点词条">${scopeMatches.length ? `<div class="scope-search-results">${scopeMatches.map(({ word, index }) => { const categoryWords = wordsForScope(book, word.category || "all"); const categoryIndex = categoryWords.findIndex(item => item === word) + 1; const status = isKnown(word, book.id) ? "已标熟" : getRecord(book.id, word).introducedAt ? "学过" : "待学习"; return `<button class="scope-search-result" data-scope-word="${index}"><strong>${escapeHtml(word.word)}</strong><span>${escapeHtml(word.category || "未分类")} · 第 ${categoryIndex} 词 · ${status}</span><small>${escapeHtml(word.meaning || "")}</small></button>`; }).join("")}</div>` : scopeSearchQuery.trim() ? '<div class="scope-search-empty">没有匹配词条</div>' : ""}</div></section>
-    <div class="study-layout"><section class="study-panel"><div class="study-panel-header"><span>签到日历</span><span class="pill">连续 ${streakDays()} 天</span></div>${renderCalendar()}<button class="secondary-button full-button" data-action="checkin">${state.checkins.includes(todayKey()) ? "今日已签到" : "今日签到"}</button></section><section class="study-panel"><div class="study-panel-header"><span>快捷入口</span></div><div class="quick-actions"><button class="quick-action" data-view="listen"><span class="quick-action-icon">♫</span><span><strong>随身听</strong><small>${book.words.length} 个词条</small></span></button><button class="quick-action" data-view="dict"><span class="quick-action-icon">⌕</span><span><strong>词典</strong><small>查词与例句</small></span></button><button class="quick-action" data-view="sentences"><span class="quick-action-icon">¶</span><span><strong>句库</strong><small>${state.favoriteSentences.length} 条例句</small></span></button><button class="quick-action" data-action="open-favorites"><span class="quick-action-icon">☆</span><span><strong>生词本</strong><small>${state.favoriteWords.length} 个收藏</small></span></button><button class="quick-action" id="backup-button"><span class="quick-action-icon">⇩</span><span><strong>导出备份</strong><small>词书与进度 JSON</small></span></button></div></section></div>
+    ${bookSummary}
+    ${renderScopePanel(book, scopedWords, scopeOptions, scopeMatches)}
+    ${renderHomeFooter(book)}
     <section class="recent-section"><div class="section-heading"><h2>最近学习</h2><button class="quiet-link" data-view="words">查看全部 →</button></div><div class="table-wrap"><table><thead><tr><th>单词</th><th>释义</th><th>状态</th></tr></thead><tbody>${recentRows(book)}</tbody></table></div></section>`;
+}
+function renderBookSummary(book, stats, percent, fresh) {
+  const known = stats.known ? ` · 已标熟 ${stats.known}` : "";
+  const primaryAction = session ? "resume-session" : "start-from-scope";
+  const primaryLabel = session?.mode === "review" ? "继续复习" : "继续学习";
+  const primaryDisabled = fresh === 0 && session?.mode !== "review" ? "disabled" : "";
+  const reviewDisabled = stats.due || session?.mode === "review" ? "" : "disabled";
+  const reviewLabel = session?.mode === "review" ? "继续复习" : `复习 ${stats.due || ""}`;
+  const cover = `<div class="book-cover">${escapeHtml(book.name.slice(0, 1))}</div>`;
+  const subtitle = `${book.words.length} 个词条 · ${escapeHtml(book.category || "自定义词书")}${known}`;
+  const progressFill = `<div class="progress-track"><div class="progress-fill" style="width:${percent}%"></div></div>`;
+  const main = `<div class="book-summary-main"><div class="book-summary-title">${escapeHtml(book.name)}</div><div class="book-summary-sub">${subtitle}</div>${progressFill}</div>`;
+  const counter = `<div class="summary-progress">${stats.learned + stats.known} / ${book.words.length}</div>`;
+  const primary = `<button class="primary-button" data-action="${primaryAction}" ${primaryDisabled}>${primaryLabel}</button>`;
+  const review = `<button class="secondary-button" data-action="start-review" ${reviewDisabled}>${reviewLabel}</button>`;
+  const actions = `<div class="summary-actions">${primary}${review}<button class="secondary-button" data-view="settings">计划</button></div>`;
+  return `<div class="book-summary">${cover}${main}${counter}${actions}</div>`;
+}
+// The learning start point: which word index and theme the next new-word
+// session begins at, plus a search box that jumps straight to a match.
+function renderScopePanel(book, scopedWords, scopeOptions, scopeMatches) {
+  const settings = state.settings;
+  const total = scopedWords.length || 1;
+  const start = Math.min(settings.vocabularyStart || 1, total);
+  const preview = scopedWords[start - 1]?.word || "超出主题范围";
+  const scopeLabel = settings.vocabularyCategory === "all" ? "共" : "主题内共";
+  const stepButton = (dir, label, glyph) => `<button type="button" data-step="${dir}" aria-label="${label}">${glyph}</button>`;
+  const startInput = `<input type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="off" maxlength="${String(total).length}" value="${start}" data-scope="vocabularyStart" aria-label="从第几个词开始">`;
+  const stepperButtons = `<span class="stepper-buttons">${stepButton(1, "增加起始词", "+")}${stepButton(-1, "减少起始词", "−")}</span>`;
+  const stepper = `<span class="number-stepper">${startInput}${stepperButtons}</span>`;
+  const startPreview = `<span class="scope-word-preview" id="scope-word-preview">${escapeHtml(preview)}</span>`;
+  const startField = `<label class="scope-start-label">从第几个词开始${stepper}${startPreview}</label>`;
+  const categoryField = `<label class="scope-category-label">主题<select class="setting-select scope-select" data-scope="vocabularyCategory"><option value="all" ${settings.vocabularyCategory === "all" ? "selected" : ""}>全部主题</option>${scopeOptions}</select></label>`;
+  const matchRows = scopeMatches.map(({ word, index }) => {
+    const categoryIndex = wordsForScope(book, word.category || "all").findIndex(item => item === word) + 1;
+    const status = isKnown(word, book.id) ? "已标熟" : getRecord(book.id, word).introducedAt ? "学过" : "待学习";
+    return `<button class="scope-search-result" data-scope-word="${index}"><strong>${escapeHtml(word.word)}</strong><span>${escapeHtml(word.category || "未分类")} · 第 ${categoryIndex} 词 · ${status}</span><small>${escapeHtml(word.meaning || "")}</small></button>`;
+  }).join("");
+  const results = scopeMatches.length
+    ? `<div class="scope-search-results">${matchRows}</div>`
+    : scopeSearchQuery.trim() ? '<div class="scope-search-empty">没有匹配词条</div>' : "";
+  const panelHead = `<div class="study-panel-header"><span>选择学习起点</span><span class="pill">仅影响新词</span></div>`;
+  const count = `<span class="scope-count">${scopeLabel} ${scopedWords.length} 个词条</span>`;
+  const startButton = `<button class="primary-button scope-start-button" data-action="start-from-scope" ${scopedWords.length ? "" : "disabled"}>开始学习</button>`;
+  const controls = `<div class="scope-controls">${startField}${categoryField}${count}${startButton}</div>`;
+  const searchInput = `<input type="search" class="scope-search-input" data-scope-search placeholder="搜索单词或释义" value="${escapeHtml(scopeSearchQuery)}" aria-label="搜索学习起点词条">`;
+  return `<section class="study-panel scope-panel">${panelHead}${controls}<div class="scope-search">${searchInput}${results}</div></section>`;
+}
+// Streak calendar and the shortcut tiles, side by side.
+function renderHomeFooter(book) {
+  const checkinLabel = state.checkins.includes(todayKey()) ? "今日已签到" : "今日签到";
+  const calendar = `<section class="study-panel"><div class="study-panel-header"><span>签到日历</span><span class="pill">连续 ${streakDays()} 天</span></div>${renderCalendar()}<button class="secondary-button full-button" data-action="checkin">${checkinLabel}</button></section>`;
+  const shortcuts = [
+    ["listen", "♫", "随身听", `${book.words.length} 个词条`, `data-view="listen"`],
+    ["dict", "⌕", "词典", "查词与例句", `data-view="dict"`],
+    ["sentences", "¶", "句库", `${state.favoriteSentences.length} 条例句`, `data-view="sentences"`],
+    ["favorites", "☆", "生词本", `${state.favoriteWords.length} 个收藏`, `data-action="open-favorites"`],
+    ["backup", "⇩", "导出备份", "词书与进度 JSON", `id="backup-button"`],
+  ].map(([, icon, title, note, attrs]) => `<button class="quick-action" ${attrs}><span class="quick-action-icon">${icon}</span><span><strong>${title}</strong><small>${note}</small></span></button>`).join("");
+  return `<div class="study-layout">${calendar}<section class="study-panel"><div class="study-panel-header"><span>快捷入口</span></div><div class="quick-actions">${shortcuts}</div></section></div>`;
 }
 function renderCalendar() {
   const days = [];
@@ -479,10 +643,28 @@ function renderCalendar() {
   }
   return `<div class="calendar">${days.join("")}</div>`;
 }
-function recentRows(book) {
-  return book.words.map(word => ({ word, record: getRecord(book.id, word) })).filter(item => item.record.lastSeen).sort((a, b) => b.record.lastSeen - a.record.lastSeen).slice(0, 5).map(({ word, record }) => `<tr><td>${escapeHtml(word.word)}</td><td>${escapeHtml(word.meaning)}</td><td><span class="word-state">${isKnown(word, book.id) ? "已标熟" : record.box >= 3 ? "已掌握" : record.box ? "学习中" : "待学习"}</span></td></tr>`).join("") || '<tr><td colspan="3" class="word-state">还没有学习记录</td></tr>';
+function recentRowState(word, record, bookId) {
+  if (isKnown(word, bookId)) return "已标熟";
+  if (record.box >= 3) return "已掌握";
+  return record.box ? "学习中" : "待学习";
 }
-function emptyHome() { return `<div class="page-heading"><div><p class="eyebrow">本地学习</p><h1>先导入一本词书</h1></div></div><section class="study-panel"><div class="empty-state"><div class="empty-mark">＋</div><strong>选择 CSV、TSV 或 JSON 词书文件</strong><p>词书和进度会保存在当前浏览器中。</p><button class="primary-button" id="empty-import">导入词书</button></div></section>`; }
+function recentRows(book) {
+  const entries = book.words
+    .map(word => ({ word, record: getRecord(book.id, word) }))
+    .filter(item => item.record.lastSeen)
+    .sort((a, b) => b.record.lastSeen - a.record.lastSeen)
+    .slice(0, 5);
+  const rows = entries.map(({ word, record }) => {
+    const state = recentRowState(word, record, book.id);
+    return `<tr><td>${escapeHtml(word.word)}</td><td>${escapeHtml(word.meaning)}</td><td><span class="word-state">${state}</span></td></tr>`;
+  }).join("");
+  return rows || '<tr><td colspan="3" class="word-state">还没有学习记录</td></tr>';
+}
+function emptyHome() {
+  const heading = '<div class="page-heading"><div><p class="eyebrow">本地学习</p><h1>先导入一本词书</h1></div></div>';
+  const body = '<section class="study-panel"><div class="empty-state"><div class="empty-mark">＋</div><strong>选择 CSV、TSV 或 JSON 词书文件</strong><p>词书和进度会保存在当前浏览器中。</p><button class="primary-button" id="empty-import">导入词书</button></div></section>';
+  return `${heading}${body}`;
+}
 
 function shuffle(list) {
   const copy = [...list];
@@ -573,7 +755,27 @@ function startSession(mode, { replace = false, fromScope = false } = {}) {
   renderSession();
 }
 function createSession(mode, words, bookId, sourceBookId) {
-  return { mode, bookId, sourceBookId, words, queue: words.map(word => ({ word, streak: 0, passes: 0 })), total: words.length, completed: 0, required: mode === "new" ? 3 : 1, answered: false, revealed: false, material: false, spelling: false, choice: null, answerGrade: null, noteDraft: "", startedAt: Date.now(), wordStartedAt: Date.now() };
+  const now = Date.now();
+  return {
+    mode,
+    bookId,
+    sourceBookId,
+    words,
+    queue: words.map(word => ({ word, streak: 0, passes: 0 })),
+    total: words.length,
+    completed: 0,
+    // New words must be recalled three times before they retire from the group.
+    required: mode === "new" ? 3 : 1,
+    answered: false,
+    revealed: false,
+    material: false,
+    spelling: false,
+    choice: null,
+    answerGrade: null,
+    noteDraft: "",
+    startedAt: now,
+    wordStartedAt: now,
+  };
 }
 function syncVocabularyStart(book) {
   if (!book || book.id !== IELTS_BOOK_ID) return;
@@ -621,7 +823,7 @@ function tabOrder() {
 function buildChoice(word, bookId) {
   const pool = state.books.find(book => book.id === bookId)?.words || [];
   const correct = meaningOf(word);
-  const groupWords = word.groupWords || [];
+  const groupWords = groupWordsOf(word);
   const sameGroup = pool.filter(item => item !== word && item.meaning && groupWords.includes(item.word) && meaningOf(item) !== correct);
   const rest = pool.filter(item => item !== word && item.meaning && !sameGroup.includes(item) && meaningOf(item) !== correct);
   const chosen = [];
@@ -639,7 +841,23 @@ function buildChoice(word, bookId) {
   if (chosen.length < 3) take(rest);
   const options = [{ word: word.word, meaning: correct, correct: true, confusable: false }].concat(chosen);
   return { options: shuffle(options), selected: null };
-}function renderSession() {
+}
+function sessionTopline(word, bookId) {
+  const phonetic = phoneticOf(word);
+  const phoneticBlock = phonetic
+    ? `<span class="accent-tag">${accentLabel()}</span>${escapeHtml(phonetic)}`
+    : escapeHtml(word.partOfSpeech || "");
+  const favorite = state.favoriteWords.includes(recordKey(bookId, word));
+  const known = isKnown(word, bookId);
+  const spellButton = state.settings.spellHint ? '<button class="word-tool" data-action="spell">abc 拼写</button>' : "";
+  const playButton = '<button class="word-tool" data-action="play-audio">▶ 发音</button>';
+  const favButton = `<button class="word-tool ${favorite ? "active" : ""}" data-action="fav-word">☆ ${favorite ? "已收藏" : "收藏"}</button>`;
+  const knownButton = `<button class="word-tool ${known ? "active" : ""}" data-action="known">${known ? "已标熟" : "标熟"}</button>`;
+  const likeButton = `<button class="like-pill" data-action="like">👍 ${likeCount(word, bookId)}</button>`;
+  const tools = `<div class="word-tools">${playButton}${favButton}${spellButton}${knownButton}${likeButton}</div>`;
+  return `<div class="learn-topline"><span class="word-phonetic">${phoneticBlock}</span>${tools}</div>`;
+}
+function renderSession() {
   if (!session) return renderShell();
   const entry = session.queue[0];
   if (!entry) return renderShell();
@@ -655,8 +873,10 @@ function buildChoice(word, bookId) {
   const spellingResult = revealed && session.answerSource === "spelling";
   const tabs = tabOrder();
   const panels = revealed && !session.choice ? `<div class="study-tabs">${tabs.map(tab => `<button class="study-tab ${activeStudyTab === tab ? "selected" : ""}" data-study-tab="${tab}">${TAB_LABELS[tab]}</button>`).join("")}</div>${renderTabPanel(word, activeStudyTab)}` : "";
+  const spellInput = '<input id="spell-input" class="spell-input" autocomplete="off" autocapitalize="off" placeholder="输入拼写，回车检查">';
+  const spellBox = `<div class="spell-box">${spellInput}<div class="spell-actions"><button class="answer-button again" data-action="cancel-spell">取消</button><button class="answer-button known" data-action="check-spell">检查</button></div></div>`;
   const actions = session.spelling
-    ? `<div class="spell-box"><input id="spell-input" class="spell-input" autocomplete="off" autocapitalize="off" placeholder="输入拼写，回车检查"><div class="spell-actions"><button class="answer-button again" data-action="cancel-spell">取消</button><button class="answer-button known" data-action="check-spell">检查</button></div></div>`
+    ? spellBox
     : revealed
       ? (session.choice
         ? `<button class="answer-button known action-right" data-action="continue">继续</button>`
@@ -665,9 +885,14 @@ function buildChoice(word, bookId) {
         ? `<button class="answer-button known action-right" data-action="reveal">看答案</button>`
         : `<button class="answer-button again action-left" data-grade="again">不认识</button><button class="answer-button unsure action-center" data-grade="unsure">模糊</button><button class="answer-button known action-right" data-grade="known">认识</button>`);
   const displayWord = session.choice && revealed && state.settings.showSyllableMarks !== false ? syllableDisplay(word) : word.word.split(" / ")[0];
-  root.innerHTML = `<div class="learn-layout"><div class="learn-toolbar"><button data-action="exit-session">← 返回</button><span>${session.mode === "review" ? "复习" : "新词学习"} · ${Math.min(session.completed + 1, total)} / ${total}${entry.streak ? ` · 连对 ${entry.streak}/${session.required}` : ""}</span><span>${total - session.completed} 剩余</span></div>
+  const topline = sessionTopline(word, bookId);
+  const modeLabel = session.mode === "review" ? "复习" : "新词学习";
+  const streakLabel = entry.streak ? ` · 连对 ${entry.streak}/${session.required}` : "";
+  const toolbarProgress = `${modeLabel} · ${Math.min(session.completed + 1, total)} / ${total}${streakLabel}`;
+  const toolbar = `<div class="learn-toolbar"><button data-action="exit-session">← 返回</button><span>${toolbarProgress}</span><span>${total - session.completed} 剩余</span></div>`;
+  root.innerHTML = `<div class="learn-layout">${toolbar}
    <article class="learn-card ${revealed ? "answered" : "recalling"}"><div class="learn-progress"><span style="width:${progress}%"></span></div>
-  <div class="learn-topline"><span class="word-phonetic">${phoneticOf(word) ? `<span class="accent-tag">${accentLabel()}</span>${escapeHtml(phoneticOf(word))}` : escapeHtml(word.partOfSpeech || "")}</span><div class="word-tools"><button class="word-tool" data-action="play-audio">▶ 发音</button><button class="word-tool ${state.favoriteWords.includes(recordKey(bookId, word)) ? "active" : ""}" data-action="fav-word">☆ ${state.favoriteWords.includes(recordKey(bookId, word)) ? "已收藏" : "收藏"}</button>${state.settings.spellHint ? '<button class="word-tool" data-action="spell">abc 拼写</button>' : ""}<button class="word-tool ${isKnown(word, bookId) ? "active" : ""}" data-action="known">${isKnown(word, bookId) ? "已标熟" : "标熟"}</button><button class="like-pill" data-action="like">👍 ${likeCount(word, bookId)}</button></div></div>
+  ${topline}
    <h1 class="learn-word">${session.spelling ? "拼写测试" : listening ? "🎧 听音选义" : escapeHtml(displayWord)}</h1>
   ${!session.spelling && !listening && variants.length ? `<div class="word-variants">${variants.map(variant => `<span>${escapeHtml(variant)}</span>`).join("")}</div>` : ""}
   ${session.spelling ? `<div class="word-meaning spell-hint">${escapeHtml(meaningOf(word))}</div>` : ""}
@@ -711,9 +936,37 @@ function renderChoice() {
     return `<button class="${cls}" data-choice="${index}"><span class="choice-meaning">${escapeHtml(option.meaning)}</span><span class="choice-word">${showWord && option.word ? escapeHtml(option.word) : ""}</span></button>`;
   }).join("")}</div>`;
 }
-const MORPHEME_PREFIXES = [["contra", "相反"], ["trans", "跨越；转变"], ["inter", "之间"], ["super", "在上；超过"], ["under", "在下；不足"], ["over", "过度；在上"], ["multi", "多"], ["micro", "微小"], ["macro", "宏大"], ["auto", "自己"], ["anti", "反对"], ["extra", "额外；超出"], ["pre", "在前；预先"], ["post", "在后"], ["sub", "在下；次于"], ["de", "否定；向下"], ["dis", "否定；分开"], ["con", "共同；加强"], ["com", "共同；加强"], ["ex", "向外；出"], ["in", "进入；否定"], ["im", "进入；否定"], ["re", "再；向后"], ["pro", "向前；支持"], ["per", "贯穿；彻底"], ["un", "否定"], ["non", "非"], ["mis", "错误"], ["co", "共同"]];
-const MORPHEME_ROOTS = [["struct", "建造"], ["spect", "看"], ["port", "携带"], ["duct", "引导"], ["ject", "投掷"], ["miss", "送；派"], ["script", "写"], ["scrib", "写"], ["graph", "写；画"], ["log", "言语；学科"], ["bio", "生命"], ["geo", "土地"], ["therm", "热"], ["chron", "时间"], ["phon", "声音"], ["photo", "光"], ["cred", "相信"], ["fer", "带来"], ["form", "形状"], ["gen", "产生"], ["gress", "行走"], ["grad", "步；级"], ["lect", "选择；读"], ["loc", "地方"], ["man", "手"], ["mar", "海"], ["meter", "测量"], ["min", "小"], ["mot", "移动"], ["mov", "移动"], ["nov", "新"], ["ped", "脚"], ["puls", "推； pulse"], ["pend", "悬挂"], ["pos", "放置"], ["prim", "第一"], ["rupt", "破裂"], ["sect", "切"], ["sens", "感觉"], ["sent", "感觉"], ["serv", "服务；保持"], ["sist", "站立"], ["sol", "太阳；单独"], ["spec", "看"], ["spir", "呼吸"], ["tact", "触摸"], ["tempor", "时间"], ["tend", "伸展"], ["terr", "土地"], ["tract", "拉；抽"], ["vac", "空"], ["vent", "来"], ["ver", "真实"], ["vis", "看"], ["vid", "看"], ["voc", "声音；召唤"], ["vol", "意愿"], ["fund", "基础"], ["dur", "持久"], ["cap", "拿；头"], ["tain", "握住"], ["fact", "做"], ["fect", "做"], ["dict", "说"], ["flu", "流动"], ["fluct", "波动"], ["mort", "死"], ["nat", "出生"], ["par", "准备；相等"], ["plic", "折叠"], ["press", "压"], ["sci", "知道"], ["sequ", "跟随"], ["sist", "站立"], ["sta", "站立"], ["uni", "一"], ["viv", "生命"]];
-const MORPHEME_SUFFIXES = [["ability", "能力"], ["ibility", "能力"], ["ization", "化"], ["isation", "化"], ["ation", "名词后缀"], ["ition", "名词后缀"], ["sion", "名词后缀"], ["tion", "名词后缀"], ["ment", "名词后缀"], ["ness", "名词后缀"], ["ance", "名词后缀"], ["ence", "名词后缀"], ["ity", "名词后缀"], ["ism", "主义；状态"], ["ist", "人"], ["ship", "状态；关系"], ["hood", "状态"], ["dom", "领域；状态"], ["able", "能…的"], ["ible", "能…的"], ["ous", "充满…的"], ["ful", "充满…的"], ["less", "没有…的"], ["ive", "有…性质的"], ["ic", "…的"], ["al", "…的"], ["ary", "…的；场所"], ["ish", "略…的"], ["like", "像…的"], ["ly", "副词后缀"], ["ize", "使…化"], ["ise", "使…化"], ["ify", "使…"], ["en", "使…"], ["ward", "向…"], ["wise", "方式"], ["er", "人；比较级"], ["or", "人"], ["ant", "人；…的"], ["ent", "人；…的"]];
+const MORPHEME_PREFIXES = [
+  ["contra", "相反"], ["trans", "跨越；转变"], ["inter", "之间"], ["super", "在上；超过"], ["under", "在下；不足"], ["over", "过度；在上"],
+  ["multi", "多"], ["micro", "微小"], ["macro", "宏大"], ["auto", "自己"], ["anti", "反对"], ["extra", "额外；超出"],
+  ["pre", "在前；预先"], ["post", "在后"], ["sub", "在下；次于"], ["de", "否定；向下"], ["dis", "否定；分开"], ["con", "共同；加强"],
+  ["com", "共同；加强"], ["ex", "向外；出"], ["in", "进入；否定"], ["im", "进入；否定"], ["re", "再；向后"], ["pro", "向前；支持"],
+  ["per", "贯穿；彻底"], ["un", "否定"], ["non", "非"], ["mis", "错误"], ["co", "共同"]
+];
+const MORPHEME_ROOTS = [
+  ["struct", "建造"], ["spect", "看"], ["port", "携带"], ["duct", "引导"], ["ject", "投掷"], ["miss", "送；派"],
+  ["script", "写"], ["scrib", "写"], ["graph", "写；画"], ["log", "言语；学科"], ["bio", "生命"], ["geo", "土地"],
+  ["therm", "热"], ["chron", "时间"], ["phon", "声音"], ["photo", "光"], ["cred", "相信"], ["fer", "带来"],
+  ["form", "形状"], ["gen", "产生"], ["gress", "行走"], ["grad", "步；级"], ["lect", "选择；读"], ["loc", "地方"],
+  ["man", "手"], ["mar", "海"], ["meter", "测量"], ["min", "小"], ["mot", "移动"], ["mov", "移动"],
+  ["nov", "新"], ["ped", "脚"], ["puls", "推； pulse"], ["pend", "悬挂"], ["pos", "放置"], ["prim", "第一"],
+  ["rupt", "破裂"], ["sect", "切"], ["sens", "感觉"], ["sent", "感觉"], ["serv", "服务；保持"], ["sist", "站立"],
+  ["sol", "太阳；单独"], ["spec", "看"], ["spir", "呼吸"], ["tact", "触摸"], ["tempor", "时间"], ["tend", "伸展"],
+  ["terr", "土地"], ["tract", "拉；抽"], ["vac", "空"], ["vent", "来"], ["ver", "真实"], ["vis", "看"],
+  ["vid", "看"], ["voc", "声音；召唤"], ["vol", "意愿"], ["fund", "基础"], ["dur", "持久"], ["cap", "拿；头"],
+  ["tain", "握住"], ["fact", "做"], ["fect", "做"], ["dict", "说"], ["flu", "流动"], ["fluct", "波动"],
+  ["mort", "死"], ["nat", "出生"], ["par", "准备；相等"], ["plic", "折叠"], ["press", "压"], ["sci", "知道"],
+  ["sequ", "跟随"], ["sist", "站立"], ["sta", "站立"], ["uni", "一"], ["viv", "生命"]
+];
+const MORPHEME_SUFFIXES = [
+  ["ability", "能力"], ["ibility", "能力"], ["ization", "化"], ["isation", "化"], ["ation", "名词后缀"], ["ition", "名词后缀"],
+  ["sion", "名词后缀"], ["tion", "名词后缀"], ["ment", "名词后缀"], ["ness", "名词后缀"], ["ance", "名词后缀"], ["ence", "名词后缀"],
+  ["ity", "名词后缀"], ["ism", "主义；状态"], ["ist", "人"], ["ship", "状态；关系"], ["hood", "状态"], ["dom", "领域；状态"],
+  ["able", "能…的"], ["ible", "能…的"], ["ous", "充满…的"], ["ful", "充满…的"], ["less", "没有…的"], ["ive", "有…性质的"],
+  ["ic", "…的"], ["al", "…的"], ["ary", "…的；场所"], ["ish", "略…的"], ["like", "像…的"], ["ly", "副词后缀"],
+  ["ize", "使…化"], ["ise", "使…化"], ["ify", "使…"], ["en", "使…"], ["ward", "向…"], ["wise", "方式"],
+  ["er", "人；比较级"], ["or", "人"], ["ant", "人；…的"], ["ent", "人；…的"]
+];
 const MEANING_STOPWORDS = ["大量", "足够", "状态", "行为", "动作", "情况", "方面", "东西", "表示", "进行", "某种", "一个", "一种", "的人", "的事", "使", "或", "与", "和", "及", "等", "地", "得"];
 function wordBase(word) { return (word.word || "").split(" / ")[0].split(" ")[0]; }
 function posOf(word) { return (word.partOfSpeech || "").toLowerCase(); }
@@ -734,9 +987,10 @@ function collocationsOf(word) {
   const example = completeExample(word.example);
   if (example) result.push({ text: example, translation: word.exampleTranslation || word.translation || "", kind: "例句" });
   const book = state.books.find(item => item.id === bookIdFor(word));
-  (word.groupWords || []).slice(0, 5).forEach(item => {
+  const index = wordIndex(book);
+  groupWordsOf(word).slice(0, 5).forEach(item => {
     if (item.toLowerCase() === word.word.toLowerCase()) return;
-    const match = book?.words.find(entry => [entry.word, ...(entry.variants || [])].some(form => form.toLowerCase() === item.toLowerCase()));
+    const match = index.get(item.toLowerCase());
     result.push({ text: item, translation: match ? meaningOf(match) : "", kind: "同组词" });
   });
   return result;
@@ -843,36 +1097,79 @@ function generatedNote(word, bookId) {
   lines.push(`记忆点：把「${base}」和上面的例句场景绑在一起，先想画面再想中文。`);
   return lines.join("\n");
 }
+function collocationRow(item, index) {
+  const showTranslation = Boolean(session.collocationTranslations?.[index]);
+  const label = showTranslation ? "显示英文" : "显示中文释义";
+  const text = showTranslation ? item.translation || "暂无译文" : item.text;
+  return `<button type="button" class="collocation-row ${showTranslation ? "translation-shown" : ""}" data-collocation="${index}" aria-label="${label}"><span class="collocation-text">${escapeHtml(text)}</span><span class="tab-src">${item.kind}</span></button>`;
+}
+// Chips for a list of related words, plus the "释义匹配" rows that explain
+// why each one was picked.
+function relatedChips(related) {
+  if (!related.length) return "";
+  const rows = related.map(item => `<div class="collocation-row"><span class="collocation-text"><strong>${escapeHtml(item.word.word)}</strong> ${escapeHtml(item.word.meaning || "")}</span><span class="tab-src">释义匹配</span></div>`).join("");
+  return `<div class="collocation-list">${rows}</div>`;
+}
+function tabPhrasePanel(word, bookId) {
+  const items = collocationsOf(word);
+  // The 例句库 view tells the reader to tap ☆ here, so this button must exist:
+  // without it no element ever emitted data-action="fav-sentence" and
+  // favourite sentences stayed permanently empty.
+  const faved = isFavoriteSentence(word, bookId);
+  const saveRow = word.example
+    ? `<div class="sentence-save-row"><p class="tab-src">例句收藏</p><button type="button" class="word-tool ${faved ? "active" : ""}" data-action="fav-sentence" aria-pressed="${faved}">☆ ${faved ? "已收藏例句" : "收藏例句"}</button></div>`
+    : "";
+  const list = items.length
+    ? `<div class="collocation-list">${items.map(collocationRow).join("")}</div>`
+    : '<p class="tab-empty">没有可用的例句或同组词。</p>';
+  return `<div class="tab-panel"><h3>词组搭配</h3>${saveRow}${list}</div>`;
+}
+function tabSynonymPanel(word, bookId) {
+  const related = relatedWordsOf(word, bookId);
+  const groups = groupWordsOf(word).filter(item => item.toLowerCase() !== word.word.toLowerCase()).slice(0, 6);
+  const reading = readingSynonyms.get(wordBase(word).toLowerCase());
+  const readingSyns = reading?.synonyms || word.synonyms || [];
+  let body = "";
+  if (readingSyns.length) body += `<p class="tab-note">阅读 538 同义替换</p>${chipRow(readingSyns)}`;
+  body += relatedChips(related);
+  if (groups.length) body += `<p class="tab-note">同组词</p>${chipRow(groups)}`;
+  if (!readingSyns.length && !related.length && !groups.length) {
+    body += `${chipRow(derivativesOf(word))}<p class="tab-note">没有语义匹配，展示同词族形式。</p>`;
+  }
+  return `<div class="tab-panel"><h3>近义与相关</h3>${body}<p class="tab-src">按阅读 538、释义关键词与同组词匹配</p></div>`;
+}
 function renderTabPanel(word, tab) {
   const bookId = bookIdFor(word);
-  if (tab === "phrase") {
-    const items = collocationsOf(word);
-    return `<div class="tab-panel"><h3>词组搭配</h3>${items.length ? `<div class="collocation-list">${items.map((item, index) => { const showTranslation = Boolean(session.collocationTranslations?.[index]); return `<button type="button" class="collocation-row ${showTranslation ? "translation-shown" : ""}" data-collocation="${index}" aria-label="${showTranslation ? "显示英文" : "显示中文释义"}"><span class="collocation-text">${escapeHtml(showTranslation ? item.translation || "暂无译文" : item.text)}</span><span class="tab-src">${item.kind}</span></button>`; }).join("")}</div>` : '<p class="tab-empty">没有可用的例句或同组词。</p>'}</div>`;
-  }
+  if (tab === "phrase") return tabPhrasePanel(word, bookId);
   if (tab === "root") {
     const parts = morphAnalyze(word);
     if (parts) {
-      return `<div class="tab-panel"><h3>词根词缀</h3><div class="root-parts">${parts.map(part => `<div class="root-part"><span class="root-type">${part.type}</span><strong>${escapeHtml(part.text)}</strong><span>${escapeHtml(part.meaning || "词干")}</span></div>`).join("")}</div><p class="tab-note">${escapeHtml(parts.map(part => part.text).join(" + "))} = ${escapeHtml(wordBase(word))}</p>${word.extra ? `<p class="tab-note">${escapeHtml(word.extra)}</p>` : ""}<p class="tab-src">按常见词根词缀表匹配，非词源考证</p></div>`;
+      const rows = parts.map(part => `<div class="root-part"><span class="root-type">${part.type}</span><strong>${escapeHtml(part.text)}</strong><span>${escapeHtml(part.meaning || "词干")}</span></div>`).join("");
+      const equation = escapeHtml(parts.map(part => part.text).join(" + "));
+      const extra = word.extra ? `<p class="tab-note">${escapeHtml(word.extra)}</p>` : "";
+      return `<div class="tab-panel"><h3>词根词缀</h3><div class="root-parts">${rows}</div><p class="tab-note">${equation} = ${escapeHtml(wordBase(word))}</p>${extra}<p class="tab-src">按常见词根词缀表匹配，非词源考证</p></div>`;
     }
-    if (!state.settings.splitMnemonic) return `<div class="tab-panel"><h3>词根词缀</h3><p class="tab-note">拆分助记已在学习偏好中关闭。</p>${word.extra ? `<p class="tab-note">${escapeHtml(word.extra)}</p>` : ""}</div>`;
-    return `<div class="tab-panel"><h3>词根词缀</h3><div class="chip-row">${spellingChunks(word).map(chunk => `<span class="chip">${escapeHtml(chunk)}</span>`).join("")}</div><p class="tab-note">未匹配到常见词根，按拼写切分。</p>${word.extra ? `<p class="tab-note">${escapeHtml(word.extra)}</p>` : ""}</div>`;
+    if (!state.settings.splitMnemonic) {
+      const extra = word.extra ? `<p class="tab-note">${escapeHtml(word.extra)}</p>` : "";
+      return `<div class="tab-panel"><h3>词根词缀</h3><p class="tab-note">拆分助记已在学习偏好中关闭。</p>${extra}</div>`;
+    }
+    const extra = word.extra ? `<p class="tab-note">${escapeHtml(word.extra)}</p>` : "";
+    return `<div class="tab-panel"><h3>词根词缀</h3>${chipRow(spellingChunks(word))}<p class="tab-note">未匹配到常见词根，按拼写切分。</p>${extra}</div>`;
   }
   if (tab === "variant") {
     const forms = inflectionsOf(word);
-    return `<div class="tab-panel"><h3>特殊变形</h3><div class="chip-row">${forms.map(item => `<span class="chip">${escapeHtml(item)}</span>`).join("")}</div><p class="tab-src">按词性规则推导，实际拼写以词典为准</p></div>`;
+    return `<div class="tab-panel"><h3>特殊变形</h3>${chipRow(forms)}<p class="tab-src">按词性规则推导，实际拼写以词典为准</p></div>`;
   }
   if (tab === "derive") {
     const forms = derivativesOf(word);
-    return `<div class="tab-panel"><h3>派生词</h3><div class="chip-row">${forms.map(item => `<span class="chip">${escapeHtml(item)}</span>`).join("")}</div>${(word.variants || []).length > 1 ? `<p class="tab-note">词条变形：${escapeHtml(word.variants.join(" / "))}</p>` : ""}<p class="tab-src">按构词规则推导，仅供参考</p></div>`;
+    const variants = (word.variants || []).length > 1 ? `<p class="tab-note">词条变形：${escapeHtml(word.variants.join(" / "))}</p>` : "";
+    return `<div class="tab-panel"><h3>派生词</h3>${chipRow(forms)}${variants}<p class="tab-src">按构词规则推导，仅供参考</p></div>`;
   }
-  if (tab === "note") return `<div class="tab-panel"><h3>我的笔记</h3><textarea id="note-input" class="note-input" placeholder="记录词根、搭配或自己的记忆点">${escapeHtml(session?.noteDraft || state.notes[recordKey(bookId, word)] || "")}</textarea><div class="note-actions"><button class="quiet-link" data-action="gen-note">生成参考笔记</button><span class="tab-src">自动保存到本设备</span></div></div>`;
-  if (tab === "synonym") {
-    const related = relatedWordsOf(word, bookId);
-    const groups = (word.groupWords || []).filter(item => item.toLowerCase() !== word.word.toLowerCase()).slice(0, 6);
-    const reading = readingSynonyms.get(wordBase(word).toLowerCase());
-    const readingSyns = reading?.synonyms || word.synonyms || [];
-    return `<div class="tab-panel"><h3>近义与相关</h3>${readingSyns.length ? `<p class="tab-note">阅读 538 同义替换</p><div class="chip-row">${readingSyns.map(item => `<span class="chip">${escapeHtml(item)}</span>`).join("")}</div>` : ""}${related.length ? `<div class="collocation-list">${related.map(item => `<div class="collocation-row"><span class="collocation-text"><strong>${escapeHtml(item.word.word)}</strong> ${escapeHtml(item.word.meaning || "")}</span><span class="tab-src">释义匹配</span></div>`).join("")}</div>` : ""}${groups.length ? `<p class="tab-note">同组词</p><div class="chip-row">${groups.map(item => `<span class="chip">${escapeHtml(item)}</span>`).join("")}</div>` : ""}${!readingSyns.length && !related.length && !groups.length ? `<div class="chip-row">${derivativesOf(word).map(item => `<span class="chip">${escapeHtml(item)}</span>`).join("")}</div><p class="tab-note">没有语义匹配，展示同词族形式。</p>` : ""}<p class="tab-src">按阅读 538、释义关键词与同组词匹配</p></div>`;
+  if (tab === "note") {
+    const draft = escapeHtml(session?.noteDraft || state.notes[recordKey(bookId, word)] || "");
+    return `<div class="tab-panel"><h3>我的笔记</h3><textarea id="note-input" class="note-input" placeholder="记录词根、搭配或自己的记忆点">${draft}</textarea><div class="note-actions"><button class="quiet-link" data-action="gen-note">生成参考笔记</button><span class="tab-src">自动保存到本设备</span></div></div>`;
   }
+  if (tab === "synonym") return tabSynonymPanel(word, bookId);
   return "";
 }
 function markAnswer(grade) {
@@ -985,29 +1282,68 @@ function exitSession() {
 }
 function renderReview() {
   const due = state.books.flatMap(book => dueWords(book.id).map(({ item, word }) => ({ book, item, word }))).sort((a, b) => a.item.dueAt - b.item.dueAt);
-  document.getElementById("view-review").innerHTML = `<div class="page-heading"><div><p class="eyebrow">按到期时间排序 · 每小结 ${state.settings.reviewChunk} 词</p><h1>复习队列</h1></div><button class="primary-button" data-action="start-review" ${due.length ? "" : "disabled"}>开始复习 ${due.length ? `· ${Math.min(due.length, state.settings.reviewChunk)}` : ""}</button></div><div class="overview-grid"><div class="metric"><div class="metric-label">今天到期</div><div class="metric-value">${due.length}<span class="metric-unit">词</span></div></div><div class="metric"><div class="metric-label">已完成复习</div><div class="metric-value">${todayStats().reviewed || 0}<span class="metric-unit">词</span></div></div><div class="metric"><div class="metric-label">词书数量</div><div class="metric-value">${state.books.length}<span class="metric-unit">本</span></div></div></div><div class="section-heading"><h2>待复习词条</h2></div>${due.length ? `<div class="review-queue">${due.slice(0, 50).map(({ book, word }) => `<div class="queue-row"><span class="queue-priority"></span><div class="queue-row-copy"><div class="queue-word">${escapeHtml(word.word)}</div><div class="queue-meta">${escapeHtml(book.name)} · ${escapeHtml(word.meaning || "暂无释义")}</div></div><div class="queue-actions"><button data-action="review-single" data-book="${escapeHtml(book.id)}" data-word="${escapeHtml(word.word)}">复习</button></div></div>`).join("")}</div>` : `<section class="study-panel"><div class="empty-state"><div class="empty-mark">✓</div><strong>目前没有到期词条</strong><p>学习新词后，系统会根据掌握情况安排复习。</p><button class="secondary-button" data-view="home">去学习新词</button></div></section>`}`;
+  const chunk = state.settings.reviewChunk;
+  const startLabel = due.length ? `开始复习 · ${Math.min(due.length, chunk)}` : "开始复习";
+  const metrics = [
+    ["今天到期", due.length, "词"],
+    ["已完成复习", todayStats().reviewed || 0, "词"],
+    ["词书数量", state.books.length, "本"],
+  ].map(([label, value, unit]) => `<div class="metric"><div class="metric-label">${label}</div><div class="metric-value">${value}<span class="metric-unit">${unit}</span></div></div>`).join("");
+  const rows = due.slice(0, 50).map(({ book, word }) => {
+    const copy = `<div class="queue-row-copy"><div class="queue-word">${escapeHtml(word.word)}</div><div class="queue-meta">${escapeHtml(book.name)} · ${escapeHtml(word.meaning || "暂无释义")}</div></div>`;
+    const open = `<div class="queue-actions"><button data-action="review-single" data-book="${escapeHtml(book.id)}" data-word="${escapeHtml(word.word)}">复习</button></div>`;
+    return `<div class="queue-row"><span class="queue-priority"></span>${copy}${open}</div>`;
+  }).join("");
+  const list = due.length
+    ? `<div class="review-queue">${rows}</div>`
+    : `<section class="study-panel"><div class="empty-state"><div class="empty-mark">✓</div><strong>目前没有到期词条</strong><p>学习新词后，系统会根据掌握情况安排复习。</p><button class="secondary-button" data-view="home">去学习新词</button></div></section>`;
+  const heading = `<div class="page-heading"><div><p class="eyebrow">按到期时间排序 · 每小结 ${chunk} 词</p><h1>复习队列</h1></div><button class="primary-button" data-action="start-review" ${due.length ? "" : "disabled"}>${startLabel}</button></div>`;
+  const queueHead = '<div class="section-heading"><h2>待复习词条</h2></div>';
+  document.getElementById("view-review").innerHTML = `${heading}<div class="overview-grid">${metrics}</div>${queueHead}${list}`;
+}
+const WORD_FILTERS = [["all", "全部"], ["new", "未学习"], ["learning", "复习中"], ["done", "复习完成"], ["known", "已标熟"], ["fav", "已收藏"]];
+function wordMatchesFilter(word, book) {
+  const record = getRecord(book.id, word);
+  const known = isKnown(word, book.id);
+  if (wordFilter === "fav") return state.favoriteWords.includes(recordKey(book.id, word));
+  if (wordFilter === "known") return known;
+  if (known) return false;
+  if (wordFilter === "new") return record.box === 0;
+  if (wordFilter === "learning") return record.box > 0 && record.box < 3;
+  if (wordFilter === "done") return record.box >= 3;
+  return true;
+}
+function renderWordRow(word, book) {
+  const record = getRecord(book.id, word);
+  const known = isKnown(word, book.id);
+  const label = known ? "已标熟" : record.box >= 3 ? "复习完成" : record.box ? "复习中" : "未学习";
+  const favorite = state.favoriteWords.includes(recordKey(book.id, word));
+  const name = escapeHtml(word.word);
+  const audio = `<button class="audio-mini" data-action="play-word" data-word="${name}">♪</button>`;
+  const actions = `<button data-action="fav-word" data-word="${name}">${favorite ? "已收藏" : "收藏"}</button><button data-action="known-word" data-word="${name}">${known ? "取消标熟" : "标熟"}</button>`;
+  return `<tr><td><span class="table-word">${audio}${name}</span></td><td>${escapeHtml(word.meaning || "")}</td><td><span class="word-state">${label}</span></td><td class="row-actions">${actions}</td></tr>`;
+}
+function renderBookManagementRow(book) {
+  const stats = bookStats(book);
+  return `<div class="book-management-row"><strong>${escapeHtml(book.name)}</strong><span>${book.words.length} 词条</span><span>${stats.learned} 已学</span><button class="danger-link" data-action="delete-book" data-book="${escapeHtml(book.id)}">删除本地词书</button></div>`;
 }
 function renderWords() {
+  const root = document.getElementById("view-words");
   const book = currentBook();
-  if (!book) { document.getElementById("view-words").innerHTML = emptyHome(); return; }
-  const filters = [["all", "全部"], ["new", "未学习"], ["learning", "复习中"], ["done", "复习完成"], ["known", "已标熟"], ["fav", "已收藏"]];
-  const filtered = book.words.filter(word => {
-    const record = getRecord(book.id, word);
-    const known = isKnown(word, book.id);
-    if (wordFilter === "fav") return state.favoriteWords.includes(recordKey(book.id, word));
-    if (wordFilter === "known") return known;
-    if (known) return false;
-    if (wordFilter === "new") return record.box === 0;
-    if (wordFilter === "learning") return record.box > 0 && record.box < 3;
-    if (wordFilter === "done") return record.box >= 3;
-    return true;
-  }).filter(word => `${word.word} ${word.meaning} ${word.example}`.toLowerCase().includes(searchQuery.toLowerCase()));
-  document.getElementById("view-words").innerHTML = `<div class="page-heading"><div><p class="eyebrow">本地词书与学习记录</p><h1>词书浏览</h1></div><div class="heading-actions"><button class="quiet-link" id="help-button">格式说明</button><button class="primary-button" id="words-import">＋ 导入词书</button></div></div><div class="book-selector">${state.books.map(item => `<button class="book-chip ${item.id === book.id ? "selected" : ""}" data-book="${escapeHtml(item.id)}">${escapeHtml(item.name)} · ${item.words.length}</button>`).join("")}<button class="book-chip" id="books-export">导出词书与进度</button></div><div class="filter-tabs">${filters.map(([value, label]) => `<button class="filter-tab ${wordFilter === value ? "selected" : ""}" data-filter-tab="${value}">${label}</button>`).join("")}</div><div class="filters"><input class="search-input" id="word-search" placeholder="搜索单词、释义或例句" value="${escapeHtml(searchQuery)}"><span class="date-label">显示 ${filtered.length} / ${book.words.length}</span></div><div class="word-table"><table><thead><tr><th>单词</th><th>释义</th><th>状态</th><th>操作</th></tr></thead><tbody>${filtered.slice(0, 300).map(word => {
-    const record = getRecord(book.id, word);
-    const known = isKnown(word, book.id);
-    const label = known ? "已标熟" : record.box >= 3 ? "复习完成" : record.box ? "复习中" : "未学习";
-    return `<tr><td><span class="table-word"><button class="audio-mini" data-action="play-word" data-word="${escapeHtml(word.word)}">♪</button>${escapeHtml(word.word)}</span></td><td>${escapeHtml(word.meaning || "")}</td><td><span class="word-state">${label}</span></td><td class="row-actions"><button data-action="fav-word" data-word="${escapeHtml(word.word)}">${state.favoriteWords.includes(recordKey(book.id, word)) ? "已收藏" : "收藏"}</button><button data-action="known-word" data-word="${escapeHtml(word.word)}">${known ? "取消标熟" : "标熟"}</button></td></tr>`;
-  }).join("") || '<tr><td colspan="4">没有匹配的词条</td></tr>'}</tbody></table></div><div class="book-management">${state.books.map(item => `<div class="book-management-row"><strong>${escapeHtml(item.name)}</strong><span>${item.words.length} 词条</span><span>${bookStats(item).learned} 已学</span><button class="danger-link" data-action="delete-book" data-book="${escapeHtml(item.id)}">删除本地词书</button></div>`).join("")}</div>`;
+  if (!book) { root.innerHTML = emptyHome(); return; }
+  const needle = searchQuery.toLowerCase();
+  const filtered = book.words.filter(word => wordMatchesFilter(word, book))
+    .filter(word => `${word.word} ${word.meaning} ${word.example}`.toLowerCase().includes(needle));
+  const heading = `<div class="page-heading"><div><p class="eyebrow">本地词书与学习记录</p><h1>词书浏览</h1></div><div class="heading-actions"><button class="quiet-link" id="help-button">格式说明</button><button class="primary-button" id="words-import">＋ 导入词书</button></div></div>`;
+  const bookChips = state.books.map(item => `<button class="book-chip ${item.id === book.id ? "selected" : ""}" data-book="${escapeHtml(item.id)}">${escapeHtml(item.name)} · ${item.words.length}</button>`).join("");
+  const selector = `<div class="book-selector">${bookChips}<button class="book-chip" id="books-export">导出词书与进度</button></div>`;
+  const tabs = `<div class="filter-tabs">${WORD_FILTERS.map(([value, label]) => `<button class="filter-tab ${wordFilter === value ? "selected" : ""}" data-filter-tab="${value}">${label}</button>`).join("")}</div>`;
+  const search = `<div class="filters"><input class="search-input" id="word-search" placeholder="搜索单词、释义或例句" value="${escapeHtml(searchQuery)}"><span class="date-label">显示 ${filtered.length} / ${book.words.length}</span></div>`;
+  const bodyRows = filtered.slice(0, 300).map(word => renderWordRow(word, book)).join("") || '<tr><td colspan="4">没有匹配的词条</td></tr>';
+  const head = "<thead><tr><th>单词</th><th>释义</th><th>状态</th><th>操作</th></tr></thead>";
+  const table = `<div class="word-table"><table>${head}<tbody>${bodyRows}</tbody></table></div>`;
+  const management = `<div class="book-management">${state.books.map(renderBookManagementRow).join("")}</div>`;
+  root.innerHTML = `${heading}${selector}${tabs}${search}${table}${management}`;
 }
 function renderListen() {
   const book = currentBook();
@@ -1016,7 +1352,27 @@ function renderListen() {
   if (listen.index >= book.words.length) listen.index = 0;
   const word = book.words[listen.index];
   const upcoming = book.words.slice(listen.index, listen.index + 30);
-  root.innerHTML = `<div class="page-heading"><div><p class="eyebrow">随身听 · 本地词表</p><h1>${escapeHtml(book.name)}</h1></div><div class="date-label">${listen.index + 1} / ${book.words.length}</div></div><div class="listen-layout"><section class="listen-main"><div class="listen-word">${escapeHtml(word.word.split(" / ")[0])}</div><div class="listen-phonetic">${phoneticOf(word) ? `<span class="accent-tag">${accentLabel()}</span>${escapeHtml(phoneticOf(word))}` : ""} ${word.partOfSpeech ? `· ${escapeHtml(word.partOfSpeech)}` : ""}</div><div class="listen-meaning">${escapeHtml(meaningOf(word))}</div><div class="listen-example"><p>${escapeHtml(word.example || "此词条没有收录例句")}</p><p class="muted">${escapeHtml(word.translation || "")}</p></div><div class="listen-controls"><button class="icon-toggle" data-action="listen-prev">◀</button><button class="listen-play" data-action="listen-play">${listen.playing ? "❚❚" : "▶"}</button><button class="icon-toggle" data-action="listen-next">▶</button><button class="icon-toggle" data-action="listen-sleep">${listen.sleepMinutes ? `⏱ ${listen.sleepMinutes}分` : "⏱ 定时"}</button></div></section><aside class="listen-list"><div class="listen-list-head">词表</div>${upcoming.map((item, offset) => `<button class="listen-row ${offset === 0 ? "current" : ""}" data-action="listen-jump" data-index="${listen.index + offset}"><span>${listen.index + offset + 1}</span><strong>${escapeHtml(item.word.split(" / ")[0])}</strong><small>${escapeHtml(item.meaning || "")}</small></button>`).join("")}</aside></div>`;
+  const heading = `<div class="page-heading"><div><p class="eyebrow">随身听 · 本地词表</p><h1>${escapeHtml(book.name)}</h1></div><div class="date-label">${listen.index + 1} / ${book.words.length}</div></div>`;
+  const phonetic = phoneticOf(word);
+  const phoneticBlock = phonetic ? `<span class="accent-tag">${accentLabel()}</span>${escapeHtml(phonetic)}` : "";
+  const posBlock = word.partOfSpeech ? `· ${escapeHtml(word.partOfSpeech)}` : "";
+  const wordLine = `<div class="listen-word">${escapeHtml(word.word.split(" / ")[0])}</div>`;
+  const phoneticLine = `<div class="listen-phonetic">${phoneticBlock} ${posBlock}</div>`;
+  const meaningLine = `<div class="listen-meaning">${escapeHtml(meaningOf(word))}</div>`;
+  const exampleBlock = `<div class="listen-example"><p>${escapeHtml(word.example || "此词条没有收录例句")}</p><p class="muted">${escapeHtml(word.translation || "")}</p></div>`;
+  const sleepLabel = listen.sleepMinutes ? `⏱ ${listen.sleepMinutes}分` : "⏱ 定时";
+  const prevButton = '<button class="icon-toggle" data-action="listen-prev">◀</button>';
+  const playButton = `<button class="listen-play" data-action="listen-play">${listen.playing ? "❚❚" : "▶"}</button>`;
+  const nextButton = '<button class="icon-toggle" data-action="listen-next">▶</button>';
+  const sleepButton = `<button class="icon-toggle" data-action="listen-sleep">${sleepLabel}</button>`;
+  const controls = `<div class="listen-controls">${prevButton}${playButton}${nextButton}${sleepButton}</div>`;
+  const main = `<section class="listen-main">${wordLine}${phoneticLine}${meaningLine}${exampleBlock}${controls}</section>`;
+  const rows = upcoming.map((item, offset) => {
+    const classes = `listen-row ${offset === 0 ? "current" : ""}`;
+    return `<button class="${classes}" data-action="listen-jump" data-index="${listen.index + offset}"><span>${listen.index + offset + 1}</span><strong>${escapeHtml(item.word.split(" / ")[0])}</strong><small>${escapeHtml(item.meaning || "")}</small></button>`;
+  }).join("");
+  const list = `<aside class="listen-list"><div class="listen-list-head">词表</div>${rows}</aside>`;
+  root.innerHTML = `${heading}<div class="listen-layout">${main}${list}</div>`;
 }
 async function loadListeningData() {
   try {
@@ -1070,18 +1426,95 @@ function nextListening(step) {
   renderListening();
   playListeningAudio();
 }
+function renderListeningEmpty() {
+  const message = escapeHtml(listeningState.message || "正在加载听力材料…");
+  const heading = `<div class="page-heading"><div><p class="eyebrow">听力 179 考点词</p><h1>听力</h1></div><div class="date-label">本地材料</div></div>`;
+  const body = `<section class="study-panel"><div class="empty-state"><div class="empty-mark">♫</div><strong>${message}</strong><p>文件位置：ielts/listening/listening179.json 与 179_audios/。</p><button class="secondary-button" data-action="load-listening">重新加载</button></div></section>`;
+  return `${heading}${body}`;
+}
+// Draft input, grading feedback and the revealed answer for one dictation item.
+function renderListeningCard(item, total) {
+  const result = listeningState.result;
+  const showAnswer = listeningState.revealed;
+  const top = `<div class="listening-top"><span class="pill">${listeningState.index + 1} / ${total}</span><button class="word-tool" data-action="listening-play">▶ 播放音频</button><button class="word-tool" data-action="listening-reveal">${showAnswer ? "隐藏答案" : "显示答案"}</button></div>`;
+  const wordInput = `<label>考点词<input id="listening-word" class="search-input" autocomplete="off" placeholder="听发音，输入单词或词组" value="${escapeHtml(listeningState.typedWord)}"></label>`;
+  const synInput = `<label>同义替换（英文逗号分隔）<input id="listening-syn" class="search-input" autocomplete="off" placeholder="例如：book, reserve" value="${escapeHtml(listeningState.typedSyn)}"></label>`;
+  const inputs = `<div class="listening-inputs">${wordInput}${synInput}</div>`;
+  let feedback = "";
+  if (result) {
+    const grade = result.wordOk && !result.missing.length ? "ok" : "bad";
+    const wordLine = result.wordOk ? "考点词正确" : `考点词错误：应为 <strong>${escapeHtml(item.word)}</strong>`;
+    const synLine = result.missing.length ? `；还缺同义词：${result.missing.map(value => `<strong>${escapeHtml(value)}</strong>`).join("、")}` : "；同义替换完整";
+    feedback = `<div class="listening-result ${grade}">${wordLine}${synLine}</div>`;
+  }
+  let answer = "";
+  if (showAnswer) {
+    const typeTag = item.type ? `<span class="tab-src">${escapeHtml(item.type)}</span>` : "";
+    const chips = (item.replace || []).map(syn => {
+      const hit = result && !result.missing.includes(syn) && result.typedSyns.includes(normalizeListenText(syn));
+      return `<span class="chip ${hit ? "hit" : ""}">${escapeHtml(syn)}</span>`;
+    }).join("");
+    answer = `<div class="listening-answer"><div class="listening-answer-head"><strong>${escapeHtml(item.word)}</strong>${typeTag}<span class="tab-src">${escapeHtml(item.meaning || "")}</span></div><div class="chip-row">${chips}</div></div>`;
+  }
+  const prevAction = `<button class="secondary-button" data-action="listening-prev">← 上一题</button>`;
+  const checkAction = `<button class="primary-button" data-action="listening-check">检查</button>`;
+  const nextAction = `<button class="secondary-button" data-action="listening-next">下一题 →</button>`;
+  const hint = '<p class="kbd-hint">回车检查；Tab 从考点词切到同义替换；按 ` 播放音频。</p>';
+  const actions = `<div class="listening-actions">${prevAction}${checkAction}${nextAction}</div>${hint}`;
+  return `<section class="listening-card">${top}${inputs}${feedback}${answer}${actions}</section>`;
+}
+function renderListeningRow(entry, index) {
+  const classes = `listening-row ${index === listeningState.index ? "current" : ""} ${state.listening.done[entry.index] ? "done" : ""}`;
+  const indexCell = `<span class="listening-index">${entry.index}</span>`;
+  const wordCell = `<span class="listening-word">${escapeHtml(entry.word)}</span>`;
+  const typeCell = `<span class="listening-type">${escapeHtml(entry.type || "")}</span>`;
+  const meaningCell = `<span class="listening-meaning">${escapeHtml(entry.meaning || "")}</span>`;
+  const synCell = `<span class="listening-syns">${escapeHtml((entry.replace || []).join(" / "))}</span>`;
+  const playButton = `<button class="audio-mini" data-action="listening-play-one" data-word="${escapeHtml(entry.word)}">▶</button>`;
+  return `<div class="${classes}" data-action="listening-jump" data-index="${index}">${indexCell}${wordCell}${typeCell}${meaningCell}${synCell}${playButton}</div>`;
+}
+function renderListeningTable() {
+  const rows = listeningData.map(renderListeningRow).join("");
+  return `<section class="listening-list-section"><div class="section-heading"><h2>全部考点词</h2><span class="date-label">点击行切换</span></div><div class="listening-table">${rows}</div></section>`;
+}
 function renderListening() {
   const root = document.getElementById("view-listening");
   const total = listeningData.length;
   const done = Object.keys(state.listening.done || {}).length;
-  if (!total) {
-    root.innerHTML = `<div class="page-heading"><div><p class="eyebrow">听力 179 考点词</p><h1>听力</h1></div><div class="date-label">本地材料</div></div><section class="study-panel"><div class="empty-state"><div class="empty-mark">♫</div><strong>${listeningState.message || "正在加载听力材料…"}</strong><p>文件位置：ielts/listening/listening179.json 与 179_audios/。</p><button class="secondary-button" data-action="load-listening">重新加载</button></div></section>`;
-    return;
+  if (!total) { root.innerHTML = renderListeningEmpty(); return; }
+  const heading = `<div class="page-heading"><div><p class="eyebrow">听力 179 考点词</p><h1>听力听写</h1></div><div class="date-label">已完成 ${done} / ${total}</div></div>`;
+  root.innerHTML = `${heading}${renderListeningCard(listeningData[listeningState.index], total)}${renderListeningTable()}`;
+}
+function chipRow(values) {
+  return `<div class="chip-row">${values.map(item => `<span class="chip">${escapeHtml(item)}</span>`).join("")}</div>`;
+}
+// "相关" tab: reading-538 synonyms first, then words sharing the meaning,
+// and only when neither exists does it fall back to the whole word group.
+function dictSynonymBody(selected, book, selectedGroup) {
+  const related = relatedWordsOf(selected, book.id);
+  const reading = readingSynonyms.get(wordBase(selected).toLowerCase());
+  const readingSyns = reading?.synonyms || selected.synonyms || [];
+  let body = "";
+  if (readingSyns.length) {
+    body += `<p class="tab-note">阅读 538 同义替换</p>${chipRow(readingSyns)}`;
   }
-  const item = listeningData[listeningState.index];
-  const result = listeningState.result;
-  const showAnswer = listeningState.revealed;
-  root.innerHTML = `<div class="page-heading"><div><p class="eyebrow">听力 179 考点词</p><h1>听力听写</h1></div><div class="date-label">已完成 ${done} / ${total}</div></div><section class="listening-card"><div class="listening-top"><span class="pill">${listeningState.index + 1} / ${total}</span><button class="word-tool" data-action="listening-play">▶ 播放音频</button><button class="word-tool" data-action="listening-reveal">${showAnswer ? "隐藏答案" : "显示答案"}</button></div><div class="listening-inputs"><label>考点词<input id="listening-word" class="search-input" autocomplete="off" placeholder="听发音，输入单词或词组" value="${escapeHtml(listeningState.typedWord)}"></label><label>同义替换（英文逗号分隔）<input id="listening-syn" class="search-input" autocomplete="off" placeholder="例如：book, reserve" value="${escapeHtml(listeningState.typedSyn)}"></label></div>${result ? `<div class="listening-result ${result.wordOk && !result.missing.length ? "ok" : "bad"}">${result.wordOk ? "考点词正确" : `考点词错误：应为 <strong>${escapeHtml(item.word)}</strong>`}${result.missing.length ? `；还缺同义词：${result.missing.map(value => `<strong>${escapeHtml(value)}</strong>`).join("、")}` : "；同义替换完整"}</div>` : ""}${showAnswer ? `<div class="listening-answer"><div class="listening-answer-head"><strong>${escapeHtml(item.word)}</strong>${item.type ? `<span class="tab-src">${escapeHtml(item.type)}</span>` : ""}<span class="tab-src">${escapeHtml(item.meaning || "")}</span></div><div class="chip-row">${(item.replace || []).map(syn => `<span class="chip ${result && !result.missing.includes(syn) && result.typedSyns.includes(normalizeListenText(syn)) ? "hit" : ""}">${escapeHtml(syn)}</span>`).join("")}</div></div>` : ""}<div class="listening-actions"><button class="secondary-button" data-action="listening-prev">← 上一题</button><button class="primary-button" data-action="listening-check">检查</button><button class="secondary-button" data-action="listening-next">下一题 →</button></div><p class="kbd-hint">回车检查；Tab 从考点词切到同义替换；按 \` 播放音频。</p></section><section class="listening-list-section"><div class="section-heading"><h2>全部考点词</h2><span class="date-label">点击行切换</span></div><div class="listening-table">${listeningData.map((entry, index) => `<div class="listening-row ${index === listeningState.index ? "current" : ""} ${state.listening.done[entry.index] ? "done" : ""}" data-action="listening-jump" data-index="${index}"><span class="listening-index">${entry.index}</span><span class="listening-word">${escapeHtml(entry.word)}</span><span class="listening-type">${escapeHtml(entry.type || "")}</span><span class="listening-meaning">${escapeHtml(entry.meaning || "")}</span><span class="listening-syns">${escapeHtml((entry.replace || []).join(" / "))}</span><button class="audio-mini" data-action="listening-play-one" data-word="${escapeHtml(entry.word)}">▶</button></div>`).join("")}</div></section>`;
+  if (related.length) {
+    const rows = related.map(item => `<div class="collocation-row"><span class="collocation-text"><strong>${escapeHtml(item.word.word)}</strong> ${escapeHtml(item.word.meaning || "")}</span><span class="tab-src">释义匹配</span></div>`).join("");
+    body += `<div class="collocation-list">${rows}</div>`;
+  }
+  if (!readingSyns.length && !related.length) {
+    body += selectedGroup.length
+      ? `${chipRow(selectedGroup)}<p class="tab-note">没有语义匹配，展示同组词。</p>`
+      : '<p class="tab-empty">没有可匹配的相关词。</p>';
+  }
+  return body;
+}
+function dictDetail(selected, body) {
+  if (!selected) return '<p class="tab-empty">搜索一个词开始。</p>';
+  const phonetic = phoneticOf(selected);
+  const phoneticBlock = phonetic ? `<span class="accent-tag">${accentLabel()}</span>${escapeHtml(phonetic)}` : "";
+  const head = `<div class="dict-head"><div><h2>${escapeHtml(selected.word)}</h2><p class="dict-phonetic">${phoneticBlock}</p></div><button class="word-audio" data-action="play-word" data-word="${escapeHtml(selected.word)}">▶ 发音</button></div>`;
+  return `${head}<div class="dict-body">${body}</div>`;
 }
 function renderDict() {
   const book = currentBook();
@@ -1094,19 +1527,44 @@ function renderDict() {
   let body = '<p class="tab-empty">没有匹配的词条。</p>';
   if (selected) {
     const key = recordKey(book.id, selected);
-    if (dictTab === "collins") body = `<div class="dict-meaning">${escapeHtml(meaningOf(selected))}</div><p class="dict-example">${escapeHtml(selected.example || "此词条没有收录例句")}</p><p class="dict-trans">${escapeHtml(selected.translation || "")}</p>`;
-    else if (dictTab === "derive") body = (selected.variants || []).length ? `<div class="chip-row">${selected.variants.map(item => `<span class="chip">${escapeHtml(item)}</span>`).join("")}</div>` : '<p class="tab-empty">没有派生形式。</p>';
-    else if (dictTab === "root") body = selected.extra ? `<p class="dict-example">${escapeHtml(selected.extra)}</p>` : '<p class="tab-empty">没有词根词缀数据。</p>';
-    else if (dictTab === "synonym") { const related = relatedWordsOf(selected, book.id); const reading = readingSynonyms.get(wordBase(selected).toLowerCase()); const readingSyns = reading?.synonyms || selected.synonyms || []; body = `${readingSyns.length ? `<p class="tab-note">阅读 538 同义替换</p><div class="chip-row">${readingSyns.map(item => `<span class="chip">${escapeHtml(item)}</span>`).join("")}</div>` : ""}${related.length ? `<div class="collocation-list">${related.map(item => `<div class="collocation-row"><span class="collocation-text"><strong>${escapeHtml(item.word.word)}</strong> ${escapeHtml(item.word.meaning || "")}</span><span class="tab-src">释义匹配</span></div>`).join("")}</div>` : ""}${!readingSyns.length && !related.length && (selected.groupWords || []).length ? `<div class="chip-row">${selected.groupWords.map(item => `<span class="chip">${escapeHtml(item)}</span>`).join("")}</div><p class="tab-note">没有语义匹配，展示同组词。</p>` : ""}${!readingSyns.length && !related.length && !(selected.groupWords || []).length ? '<p class="tab-empty">没有可匹配的相关词。</p>' : ""}`; }
-    else if (dictTab === "exam") body = (selected.groupWords || []).length ? `<div class="chip-row">${selected.groupWords.map(item => `<span class="chip">${escapeHtml(item)}</span>`).join("")}</div>` : '<p class="tab-empty">没有同组词数据。</p>';
-    else if (dictTab === "note") body = state.notes[key] ? `<p class="dict-example">${escapeHtml(state.notes[key])}</p>` : '<p class="tab-empty">还没有笔记，可在学习卡片中记录。</p>';
+    const selectedGroup = groupWordsOf(selected);
+    if (dictTab === "collins") {
+      const example = escapeHtml(selected.example || "此词条没有收录例句");
+      body = `<div class="dict-meaning">${escapeHtml(meaningOf(selected))}</div><p class="dict-example">${example}</p><p class="dict-trans">${escapeHtml(selected.translation || "")}</p>`;
+    } else if (dictTab === "derive") {
+      body = (selected.variants || []).length ? chipRow(selected.variants) : '<p class="tab-empty">没有派生形式。</p>';
+    } else if (dictTab === "root") {
+      body = selected.extra ? `<p class="dict-example">${escapeHtml(selected.extra)}</p>` : '<p class="tab-empty">没有词根词缀数据。</p>';
+    } else if (dictTab === "synonym") {
+      body = dictSynonymBody(selected, book, selectedGroup);
+    } else if (dictTab === "exam") {
+      body = selectedGroup.length ? chipRow(selectedGroup) : '<p class="tab-empty">没有同组词数据。</p>';
+    } else if (dictTab === "note") {
+      body = state.notes[key] ? `<p class="dict-example">${escapeHtml(state.notes[key])}</p>` : '<p class="tab-empty">还没有笔记，可在学习卡片中记录。</p>';
+    }
   }
-  root.innerHTML = `<div class="page-heading"><div><p class="eyebrow">本地词典 · 不联网</p><h1>词典</h1></div><div class="date-label">${book.name}</div></div><div class="dict-search"><input class="search-input" id="dict-search" placeholder="搜索单词、释义或例句" value="${escapeHtml(dictQuery)}"></div><div class="filter-tabs">${tabs.map(([value, label]) => `<button class="filter-tab ${dictTab === value ? "selected" : ""}" data-dict-tab="${value}">${label}</button>`).join("")}</div><div class="dict-layout"><div class="dict-results">${results.map(word => `<button class="dict-row ${selected === word ? "selected" : ""}" data-dict-word="${escapeHtml(word.word)}"><strong>${escapeHtml(word.word.split(" / ")[0])}</strong><small>${escapeHtml(word.meaning || "")}</small></button>`).join("") || '<p class="tab-empty">无结果</p>'}</div><section class="dict-detail">${selected ? `<div class="dict-head"><div><h2>${escapeHtml(selected.word)}</h2><p class="dict-phonetic">${phoneticOf(selected) ? `<span class="accent-tag">${accentLabel()}</span>${escapeHtml(phoneticOf(selected))}` : ""}</p></div><button class="word-audio" data-action="play-word" data-word="${escapeHtml(selected.word)}">▶ 发音</button></div><div class="dict-body">${body}</div>` : '<p class="tab-empty">搜索一个词开始。</p>'}</section></div>`;
+  const heading = `<div class="page-heading"><div><p class="eyebrow">本地词典 · 不联网</p><h1>词典</h1></div><div class="date-label">${book.name}</div></div>`;
+  const searchRow = `<div class="dict-search"><input class="search-input" id="dict-search" placeholder="搜索单词、释义或例句" value="${escapeHtml(dictQuery)}"></div>`;
+  const tabRow = `<div class="filter-tabs">${tabs.map(([value, label]) => `<button class="filter-tab ${dictTab === value ? "selected" : ""}" data-dict-tab="${value}">${label}</button>`).join("")}</div>`;
+  const resultRows = results.map(word => {
+    const classes = `dict-row ${selected === word ? "selected" : ""}`;
+    const head = `<strong>${escapeHtml(word.word.split(" / ")[0])}</strong>`;
+    const tail = `<small>${escapeHtml(word.meaning || "")}</small>`;
+    return `<button class="${classes}" data-dict-word="${escapeHtml(word.word)}">${head}${tail}</button>`;
+  }).join("") || '<p class="tab-empty">无结果</p>';
+  root.innerHTML = `${heading}${searchRow}${tabRow}<div class="dict-layout"><div class="dict-results">${resultRows}</div><section class="dict-detail">${dictDetail(selected, body)}</section></div>`;
+}
+function sentenceCard(item) {
+  const label = `<p class="sentence-cn"><span class="sentence-label">是什么意思</span>${escapeHtml(item.translation || "")}</p>`;
+  const foot = `<div class="sentence-foot"><span>${escapeHtml(item.word)} · ${escapeHtml(item.source || "")}</span><button class="quiet-link" data-action="unfav-sentence" data-key="${escapeHtml(item.id)}">移除</button></div>`;
+  return `<article class="sentence-card"><p class="sentence-en">${escapeHtml(item.sentence)}</p>${label}${foot}</article>`;
 }
 function renderSentences() {
   const root = document.getElementById("view-sentences");
   const items = state.favoriteSentences;
-  root.innerHTML = `<div class="page-heading"><div><p class="eyebrow">收藏的例句</p><h1>例句库</h1><p class="page-sub">收藏学习卡片中的例句，英文原句下方标注它是什么意思。</p></div><div class="date-label">${items.length} 条</div></div>${items.length ? `<div class="sentence-list">${items.map(item => `<article class="sentence-card"><p class="sentence-en">${escapeHtml(item.sentence)}</p><p class="sentence-cn"><span class="sentence-label">是什么意思</span>${escapeHtml(item.translation || "")}</p><div class="sentence-foot"><span>${escapeHtml(item.word)} · ${escapeHtml(item.source || "")}</span><button class="quiet-link" data-action="unfav-sentence" data-key="${escapeHtml(item.id)}">移除</button></div></article>`).join("")}</div>` : `<section class="study-panel"><div class="empty-state"><div class="empty-mark">¶</div><strong>还没有任何例句</strong><p>点击例句卡片的 ☆ 收藏例句，这里会显示英文原句和它是什么意思。</p><button class="secondary-button" data-view="home">去学习</button></div></section>`}`;
+  const heading = `<div class="page-heading"><div><p class="eyebrow">收藏的例句</p><h1>例句库</h1><p class="page-sub">收藏学习卡片中的例句，英文原句下方标注它是什么意思。</p></div><div class="date-label">${items.length} 条</div></div>`;
+  const empty = `<section class="study-panel"><div class="empty-state"><div class="empty-mark">¶</div><strong>还没有任何例句</strong><p>点击例句卡片的 ☆ 收藏例句，这里会显示英文原句和它是什么意思。</p><button class="secondary-button" data-view="home">去学习</button></div></section>`;
+  root.innerHTML = `${heading}${items.length ? `<div class="sentence-list">${items.map(sentenceCard).join("")}</div>` : empty}`;
 }
 async function loadReferenceData() {
   try {
@@ -1131,23 +1589,65 @@ async function loadReferenceData() {
   } catch (error) { /* manifest is optional */ }
   if (currentView === "materials") renderMaterials();
 }
+function materialsEmpty(message) {
+  const text = materialsMessage || message;
+  return `<section class="materials-panel"><div class="empty-state"><strong>${text}</strong><button class="secondary-button" data-action="load-references">重新加载</button></div></section>`;
+}
+function materialsWritingBody(writing) {
+  if (!writing.length) return materialsEmpty("写作资料未加载");
+  // Titles and sentence cards share one ordered walk, so the section headers
+  // stay in the position the source file put them.
+  const parts = writingSentences.map(item => {
+    if (item && item.title) return `<div class="writing-section">${escapeHtml(item.title)}</div>`;
+    if (!item || !item.sentence) return "";
+    const no = item.no ? `<span class="writing-no">${item.no}</span>` : "";
+    const alt = item.chatgpt && item.chatgpt !== item.translationFromBook
+      ? `<p class="writing-en alt">${escapeHtml(item.chatgpt)}</p>` : "";
+    const remark = item.remark ? `<p class="tab-src">${escapeHtml(item.remark)}</p>` : "";
+    return `<article class="writing-card"><p class="writing-cn">${no}${escapeHtml(item.sentence)}</p><p class="writing-en">${escapeHtml(item.translationFromBook || "")}</p>${alt}${remark}</article>`;
+  }).join("");
+  const head = `<div class="materials-head"><strong>写作 100 句</strong><span class="tab-src">${writing.length} 句 · 中文原句 + 参考译文</span></div>`;
+  return `<section class="materials-panel">${head}${parts}</section>`;
+}
+function readingRow(row) {
+  const word = `<span class="reading-word">${escapeHtml(row[1])}</span>`;
+  const pos = `<span class="reading-pos">${escapeHtml((row[2] || []).join("."))}</span>`;
+  const meaning = `<span class="reading-meaning">${escapeHtml((row[3] || []).join("；"))}</span>`;
+  const syns = `<span class="reading-syns">${escapeHtml((row[4] || []).join(" / "))}</span>`;
+  return `<div class="reading-row">${word}${pos}${meaning}${syns}</div>`;
+}
+function materialsReadingBody(readingCount) {
+  if (!readingGroups.length) return materialsEmpty("阅读资料未加载");
+  const groups = readingGroups.map(group => {
+    const require = group.require ? ` · ${escapeHtml(group.require)}` : "";
+    const head = `<div class="reading-group-head"><strong>${escapeHtml(group.title || "")}</strong><span class="tab-src">${escapeHtml(group.define || "")}${require}</span></div>`;
+    const rows = (group.words || []).map(readingRow).join("");
+    return `<div class="reading-group">${head}${rows}</div>`;
+  }).join("");
+  const head = `<div class="materials-head"><strong>阅读 538 考点词</strong><span class="tab-src">${readingGroups.length} 组 · ${readingCount} 词</span><button class="primary-button" data-action="import-reading-book">导入为词书</button></div>`;
+  return `<section class="materials-panel">${head}${groups}</section>`;
+}
+function materialsGrammarBody() {
+  const files = materialManifest.grammar || [];
+  const links = files.map(file => {
+    const href = `./ielts/grammar/${encodeURIComponent(file.name)}`;
+    return `<a class="material-link" href="${href}" target="_blank" rel="noopener"><span class="material-link-name">${escapeHtml(file.name)}</span><span class="material-link-size">${Math.round(file.size / 1024)} KB</span><span class="material-link-open">打开 →</span></a>`;
+  }).join("");
+  const head = `<div class="materials-head"><strong>语法资料</strong><span class="tab-src">本地 PDF / SVG</span></div>`;
+  return `<section class="materials-panel">${head}${files.length ? links : '<p class="tab-empty">没有找到语法资料文件。</p>'}</section>`;
+}
 function renderMaterials() {
   const root = document.getElementById("view-materials");
   const tabs = [["writing", "写作 100 句"], ["reading", "阅读 538 词"], ["grammar", "语法资料"]];
   const writing = writingSentences.filter(item => item && item.sentence);
   const readingCount = readingGroups.reduce((sum, group) => sum + (group.words || []).length, 0);
   let body = "";
-  if (materialTab === "writing") {
-    body = writing.length ? `<section class="materials-panel"><div class="materials-head"><strong>写作 100 句</strong><span class="tab-src">${writing.length} 句 · 中文原句 + 参考译文</span></div>${writingSentences.map(item => item && item.title ? `<div class="writing-section">${escapeHtml(item.title)}</div>` : (item && item.sentence ? `<article class="writing-card"><p class="writing-cn">${item.no ? `<span class="writing-no">${item.no}</span>` : ""}${escapeHtml(item.sentence)}</p><p class="writing-en">${escapeHtml(item.translationFromBook || "")}</p>${item.chatgpt && item.chatgpt !== item.translationFromBook ? `<p class="writing-en alt">${escapeHtml(item.chatgpt)}</p>` : ""}${item.remark ? `<p class="tab-src">${escapeHtml(item.remark)}</p>` : ""}</article>` : "")).join("")}</section>` : `<section class="materials-panel"><div class="empty-state"><strong>${materialsMessage || "写作资料未加载"}</strong><button class="secondary-button" data-action="load-references">重新加载</button></div></section>`;
-  }
-  if (materialTab === "reading") {
-    body = readingGroups.length ? `<section class="materials-panel"><div class="materials-head"><strong>阅读 538 考点词</strong><span class="tab-src">${readingGroups.length} 组 · ${readingCount} 词</span><button class="primary-button" data-action="import-reading-book">导入为词书</button></div>${readingGroups.map(group => `<div class="reading-group"><div class="reading-group-head"><strong>${escapeHtml(group.title || "")}</strong><span class="tab-src">${escapeHtml(group.define || "")}${group.require ? ` · ${escapeHtml(group.require)}` : ""}</span></div>${(group.words || []).map(row => `<div class="reading-row"><span class="reading-word">${escapeHtml(row[1])}</span><span class="reading-pos">${escapeHtml((row[2] || []).join("."))}</span><span class="reading-meaning">${escapeHtml((row[3] || []).join("；"))}</span><span class="reading-syns">${escapeHtml((row[4] || []).join(" / "))}</span></div>`).join("")}</div>`).join("")}</section>` : `<section class="materials-panel"><div class="empty-state"><strong>${materialsMessage || "阅读资料未加载"}</strong><button class="secondary-button" data-action="load-references">重新加载</button></div></section>`;
-  }
-  if (materialTab === "grammar") {
-    const files = materialManifest.grammar || [];
-    body = `<section class="materials-panel"><div class="materials-head"><strong>语法资料</strong><span class="tab-src">本地 PDF / SVG</span></div>${files.length ? files.map(file => `<a class="material-link" href="./ielts/grammar/${encodeURIComponent(file.name)}" target="_blank" rel="noopener"><span class="material-link-name">${escapeHtml(file.name)}</span><span class="material-link-size">${Math.round(file.size / 1024)} KB</span><span class="material-link-open">打开 →</span></a>`).join("") : '<p class="tab-empty">没有找到语法资料文件。</p>'}</section>`;
-  }
-  root.innerHTML = `<div class="page-heading"><div><p class="eyebrow">本地资料库</p><h1>资料</h1></div><div class="date-label">不联网 · 随项目分发</div></div><div class="filter-tabs">${tabs.map(([value, label]) => `<button class="filter-tab ${materialTab === value ? "selected" : ""}" data-material-tab="${value}">${label}</button>`).join("")}</div>${body}`;
+  if (materialTab === "writing") body = materialsWritingBody(writing);
+  if (materialTab === "reading") body = materialsReadingBody(readingCount);
+  if (materialTab === "grammar") body = materialsGrammarBody();
+  const heading = `<div class="page-heading"><div><p class="eyebrow">本地资料库</p><h1>资料</h1></div><div class="date-label">不联网 · 随项目分发</div></div>`;
+  const tabRow = `<div class="filter-tabs">${tabs.map(([value, label]) => `<button class="filter-tab ${materialTab === value ? "selected" : ""}" data-material-tab="${value}">${label}</button>`).join("")}</div>`;
+  root.innerHTML = `${heading}${tabRow}${body}`;
 }
 function importReadingBook() {
   if (!readingGroups.length) { toast("阅读资料未加载"); return; }
@@ -1177,30 +1677,105 @@ function renderSettings() {
   const toggle = (key, on) => `<button class="switch ${on ? "on" : ""}" data-toggle="${key}" role="switch" aria-checked="${on}"></button>`;
   const options = (key, values, value) => `<select class="setting-select" data-setting="${key}">${values.map(([v, label]) => `<option value="${v}" ${String(v) === String(value) ? "selected" : ""}>${label}</option>`).join("")}</select>`;
   const fontStepper = `<span class="font-stepper"><button type="button" data-font-step="-1" aria-label="减小全局字号">−</button><output>${s.globalFontSize > 0 ? `+${s.globalFontSize}` : s.globalFontSize}px</output><button type="button" data-font-step="1" aria-label="增大全局字号">+</button></span>`;
-  document.getElementById("view-settings").innerHTML = `<div class="page-heading"><div><p class="eyebrow">学习设置</p><h1>学习偏好</h1></div><div class="date-label">仅保存在本设备</div></div><section class="settings-card">${row("窗口操作", "控制应用窗口", '<span class="window-actions"><button class="secondary-button" type="button" data-window="minimize">最小化</button><button class="secondary-button" type="button" data-window="maximize">最大化</button><button class="secondary-button" type="button" data-window="close">关闭</button></span>')}${row("全局字号", "所有页面文字整体调整，每次改变 1px", fontStepper)}${row("单词发音类型", "", `<button class="segmented" data-action="toggle-accent"><span class="${s.accent === "uk" ? "on" : ""}">英式</span><span class="${s.accent === "us" ? "on" : ""}">美式</span></button>`)}${row("自动发音", "进入卡片时自动播放", toggle("autoPronounce", s.autoPronounce))}${row("拼写", "学习、复习时提供拼写提示", toggle("spellHint", s.spellHint))}${row("学习节奏", "每组新词数量", options("groupSize", [[10, "10 词/组"], [20, "20 词/组"], [30, "30 词/组"]], s.groupSize))}${row("复习节奏", "每次复习小结数量", options("reviewChunk", [[50, "50 词/小结"], [100, "100 词/小结"], [150, "150 词/小结"]], s.reviewChunk))}${row("听音选义题型", "听到发音后选择释义", toggle("listeningQuiz", s.listeningQuiz))}${row("答题后显示音节标记", "答题后在单词中显示音节分隔点", toggle("showSyllableMarks", s.showSyllableMarks !== false))}${row("拆分助记", "学习时自动拆分单词", toggle("splitMnemonic", s.splitMnemonic))}${row("混淆项辨析", "显示选择题错误选项词义", toggle("confuseAnalyze", s.confuseAnalyze))}${row("助记顺序", "调整学习卡片内容顺序", `<button class="quiet-link" data-action="order-open">${orderOpen ? "收起" : "调整"}</button>`)}</section>${orderOpen ? renderOrderEditor() : ""}<section class="settings-card">${row("外观与沉浸场景", "主题、字体与背景", '<button class="quiet-link" data-view="appearance">前往 →</button>')}</section>`;
+  const windowButton = (cmd, label) => `<button class="secondary-button" type="button" data-window="${cmd}">${label}</button>`;
+  const windowActions = `<span class="window-actions">${windowButton("minimize", "最小化")}${windowButton("maximize", "最大化")}${windowButton("close", "关闭")}</span>`;
+  const accentToggle = `<button class="segmented" data-action="toggle-accent"><span class="${s.accent === "uk" ? "on" : ""}">英式</span><span class="${s.accent === "us" ? "on" : ""}">美式</span></button>`;
+  const rows = [
+    row("窗口操作", "控制应用窗口", windowActions),
+    row("全局字号", "所有页面文字整体调整，每次改变 1px", fontStepper),
+    row("单词发音类型", "", accentToggle),
+    row("自动发音", "进入卡片时自动播放", toggle("autoPronounce", s.autoPronounce)),
+    row("拼写", "学习、复习时提供拼写提示", toggle("spellHint", s.spellHint)),
+    row("学习节奏", "每组新词数量", options("groupSize", [[10, "10 词/组"], [20, "20 词/组"], [30, "30 词/组"]], s.groupSize)),
+    row("复习节奏", "每次复习小结数量", options("reviewChunk", [[50, "50 词/小结"], [100, "100 词/小结"], [150, "150 词/小结"]], s.reviewChunk)),
+    row("听音选义题型", "听到发音后选择释义", toggle("listeningQuiz", s.listeningQuiz)),
+    row("答题后显示音节标记", "答题后在单词中显示音节分隔点", toggle("showSyllableMarks", s.showSyllableMarks !== false)),
+    row("拆分助记", "学习时自动拆分单词", toggle("splitMnemonic", s.splitMnemonic)),
+    row("混淆项辨析", "显示选择题错误选项词义", toggle("confuseAnalyze", s.confuseAnalyze)),
+    row("助记顺序", "调整学习卡片内容顺序", `<button class="quiet-link" data-action="order-open">${orderOpen ? "收起" : "调整"}</button>`),
+  ].join("");
+  const appearanceRow = row("外观与沉浸场景", "主题、字体与背景", '<button class="quiet-link" data-view="appearance">前往 →</button>');
+  const heading = '<div class="page-heading"><div><p class="eyebrow">学习设置</p><h1>学习偏好</h1></div><div class="date-label">仅保存在本设备</div></div>';
+  const orderCard = orderOpen ? renderOrderEditor() : "";
+  const appearanceCard = `<section class="settings-card">${appearanceRow}</section>`;
+  document.getElementById("view-settings").innerHTML = `${heading}<section class="settings-card">${rows}</section>${orderCard}${appearanceCard}`;
+}
+function orderRow(tab, index) {
+  const total = tabOrder().length;
+  const up = `<button data-action="order-move" data-index="${index}" data-dir="-1" ${index === 0 ? "disabled" : ""}>↑</button>`;
+  const down = `<button data-action="order-move" data-index="${index}" data-dir="1" ${index === total - 1 ? "disabled" : ""}>↓</button>`;
+  return `<div class="order-row"><span>${TAB_LABELS[tab]}</span><div class="order-actions">${up}${down}</div></div>`;
 }
 function renderOrderEditor() {
-  return `<section class="settings-card order-card"><div class="settings-row"><div><strong>助记顺序</strong><small>从上到下排列，使用箭头调整</small></div></div>${tabOrder().map((tab, index) => `<div class="order-row"><span>${TAB_LABELS[tab]}</span><div class="order-actions"><button data-action="order-move" data-index="${index}" data-dir="-1" ${index === 0 ? "disabled" : ""}>↑</button><button data-action="order-move" data-index="${index}" data-dir="1" ${index === tabOrder().length - 1 ? "disabled" : ""}>↓</button></div></div>`).join("")}</section>`;
+  const head = `<div class="settings-row"><div><strong>助记顺序</strong><small>从上到下排列，使用箭头调整</small></div></div>`;
+  const rows = tabOrder().map(orderRow).join("");
+  return `<section class="settings-card order-card">${head}${rows}</section>`;
+}
+function appearanceSwitchRow(label, desc, key, on, ariaLabel = "") {
+  const aria = ariaLabel ? ` aria-label="${ariaLabel}"` : "";
+  return `<div class="settings-row"><div><strong>${label}</strong><small>${desc}</small></div><button class="switch ${on ? "on" : ""}" data-toggle="${key}" role="switch" aria-checked="${on}"${aria}></button></div>`;
 }
 function renderAppearance() {
   const s = state.settings;
   const themes = [["light", "明亮"], ["deep", "深邃"], ["night", "极夜"]];
-   const fontSelect = (key, options, value, label) => `<label class="font-select-row"><span>${label}</span><select class="setting-select font-select" data-font-family="${key}" aria-label="${label}">${Object.entries(options).map(([id, option]) => `<option value="${id}" ${value === id ? "selected" : ""}>${option.label}</option>`).join("")}</select></label>`;
-    document.getElementById("view-appearance").innerHTML = `<div class="page-heading"><div><p class="eyebrow">外观</p><h1>主题与字体</h1></div><div class="date-label">跟随系统时可自动切换</div></div><div class="theme-grid">${themes.map(([value, label]) => `<button class="theme-card ${s.theme === value ? "selected" : ""}" data-theme-set="${value}"><span class="theme-preview ${value}"></span><strong>${label}</strong></button>`).join("")}</div><section class="settings-card"><div class="settings-row"><div><strong>透明窗口</strong><small>按住 Alt 并拖动窗口内容可移动</small></div><button class="switch ${s.glassEnabled ? "on" : ""}" data-toggle="glassEnabled" role="switch" aria-checked="${s.glassEnabled}" aria-label="透明窗口"></button></div><div class="settings-row"><div><strong>透明度</strong><small>0% 背景透明，100% 不透明</small></div><label class="opacity-control"><input type="range" min="0" max="100" step="1" value="${Math.round(Math.max(0, (s.glassOpacity ?? DEFAULT_SETTINGS.glassOpacity) * 100))}" data-glass-opacity aria-label="透明度" ${s.glassEnabled ? "" : "disabled"}><output data-glass-opacity-value>${Math.round(Math.max(0, (s.glassOpacity ?? DEFAULT_SETTINGS.glassOpacity) * 100))}%</output></label></div><div class="settings-row"><div><strong>跟随系统</strong><small>根据系统深浅色自动切换</small></div><button class="switch ${s.followSystem ? "on" : ""}" data-toggle="followSystem" role="switch" aria-checked="${s.followSystem}"></button></div><div class="font-family-grid">${fontSelect("chineseFont", FONT_OPTIONS.chinese, s.chineseFont || DEFAULT_SETTINGS.chineseFont, "中文字体")}${fontSelect("englishFont", FONT_OPTIONS.english, s.englishFont || DEFAULT_SETTINGS.englishFont, "英文字体")}</div></section>`;
+  const opacityPercent = Math.round(Math.max(0, (s.glassOpacity ?? DEFAULT_SETTINGS.glassOpacity) * 100));
+  const fontSelect = (key, options, value, label) => {
+    const choices = Object.entries(options)
+      .map(([id, option]) => `<option value="${id}" ${value === id ? "selected" : ""}>${option.label}</option>`)
+      .join("");
+    const select = `<select class="setting-select font-select" data-font-family="${key}" aria-label="${label}">${choices}</select>`;
+    return `<label class="font-select-row"><span>${label}</span>${select}</label>`;
+  };
+  const themeCards = themes.map(([value, label]) => `<button class="theme-card ${s.theme === value ? "selected" : ""}" data-theme-set="${value}"><span class="theme-preview ${value}"></span><strong>${label}</strong></button>`).join("");
+  // 0% is a legitimate setting but it strips every panel to fully transparent,
+  // which reads as a broken UI; say so rather than silently looking wrong.
+  const clearWarning = s.glassEnabled && opacityPercent === 0
+    ? '<small class="opacity-warning">当前为完全透明，背景内容可能看不清；把滑块往右调即可恢复。侧栏始终保留一层淡色底。</small>'
+    : "";
+  const heading = `<div class="page-heading"><div><p class="eyebrow">外观</p><h1>主题与字体</h1></div><div class="date-label">跟随系统时可自动切换</div></div>`;
+  const themeGrid = `<div class="theme-grid">${themeCards}</div>`;
+  const glassRow = appearanceSwitchRow("透明窗口", "窗口右上角的 ⠿ 可拖动，也可按住 Alt 拖动页面", "glassEnabled", s.glassEnabled, "透明窗口");
+  const opacityHint = `<strong>透明度</strong><small>0% 背景透明，100% 不透明</small>${clearWarning}`;
+  const slider = `<label class="opacity-control"><input type="range" min="0" max="100" step="1" value="${opacityPercent}" data-glass-opacity aria-label="透明度" ${s.glassEnabled ? "" : "disabled"}><output data-glass-opacity-value>${opacityPercent}%</output></label>`;
+  const opacityRow = `<div class="settings-row"><div>${opacityHint}</div>${slider}</div>`;
+  const followRow = appearanceSwitchRow("跟随系统", "根据系统深浅色自动切换", "followSystem", s.followSystem);
+  const chineseFont = fontSelect("chineseFont", FONT_OPTIONS.chinese, s.chineseFont || DEFAULT_SETTINGS.chineseFont, "中文字体");
+  const englishFont = fontSelect("englishFont", FONT_OPTIONS.english, s.englishFont || DEFAULT_SETTINGS.englishFont, "英文字体");
+  const card = `<section class="settings-card">${glassRow}${opacityRow}${followRow}<div class="font-family-grid">${chineseFont}${englishFont}</div></section>`;
+  document.getElementById("view-appearance").innerHTML = `${heading}${themeGrid}${card}`;
 }
 function toast(message) { const node = document.getElementById("toast"); node.textContent = message; node.classList.add("show"); clearTimeout(toastTimer); toastTimer = setTimeout(() => node.classList.remove("show"), 2600); }
 function exportBackup() {
-  const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" }); const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = `cixu-backup-${todayKey()}.json`; link.click(); URL.revokeObjectURL(link.href); toast("已导出词书与学习进度");
+  const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = `cixu-backup-${todayKey()}.json`;
+  link.click();
+  URL.revokeObjectURL(link.href);
+  toast("已导出词书与学习进度");
 }
 async function importFile(file) {
   try {
+    if (file.size > MAX_JSON_BYTES) throw new Error("文件过大（上限 32 MB），请拆分后再导入");
     const text = await file.text();
     if (file.name.toLowerCase().endsWith(".json")) {
       const parsed = JSON.parse(text);
-      if (Array.isArray(parsed.books) && parsed.records && parsed.reviews) {
-        state = { ...parsed, notes: parsed.notes || {}, favoriteWords: parsed.favoriteWords || [], favoriteSentences: parsed.favoriteSentences || [], likes: parsed.likes || {}, known: parsed.known || {}, checkins: parsed.checkins || [], settings: { ...DEFAULT_SETTINGS, ...(parsed.settings || {}) } };
+      if (isPlainObject(parsed) && Array.isArray(parsed.books) && isPlainObject(parsed.records) && isPlainObject(parsed.reviews)) {
+        const books = parsed.books.filter(book => isPlainObject(book) && typeof book.id === "string" && Array.isArray(book.words)).slice(0, MAX_BOOKS);
+        if (!books.length) throw new Error("备份文件里没有可用的词书");
+        state = {
+          ...parsed,
+          books,
+          notes: parsed.notes || {},
+          favoriteWords: parsed.favoriteWords || [],
+          favoriteSentences: parsed.favoriteSentences || [],
+          likes: parsed.likes || {},
+          known: parsed.known || {},
+          checkins: parsed.checkins || [],
+          settings: { ...DEFAULT_SETTINGS, ...(parsed.settings || {}) },
+        };
         session = state.session?.queue?.length ? state.session : null;
-        currentBookId = state.activeBookId || state.books[0]?.id;
+        currentBookId = books.some(book => book.id === state.activeBookId) ? state.activeBookId : books[0].id;
         const importedIelts = state.books.find(book => book.id === IELTS_BOOK_ID);
         if (importedIelts) syncVocabularyStart(importedIelts);
         persist(); applyTheme(); currentView = "home"; renderShell(); toast("已恢复词书与学习进度"); return;
@@ -1210,17 +1785,28 @@ async function importFile(file) {
     const unique = new Map();
     let skipped = 0;
     imported.words.forEach(word => {
-      if (!word?.word || !word.meaning) { skipped++; return; }
+      if (!word?.word || !word.meaning || word.word.length > MAX_FIELD_CHARS) { skipped++; return; }
       unique.set(word.word.toLowerCase(), word);
     });
     if (!unique.size) throw new Error("没有有效词条；每个词条必须包含单词和中文释义");
+    if (unique.size > MAX_IMPORT_WORDS) throw new Error(`词条过多（上限 ${MAX_IMPORT_WORDS} 条），请拆分后再导入`);
+    if (state.books.length >= MAX_BOOKS) throw new Error(`词书数量已达上限（${MAX_BOOKS} 本），请先删除不需要的词书`);
     const id = `book-${Date.now().toString(36)}`;
-    state.books.push({ id, name: imported.name || "导入词书", category: "导入", createdAt: Date.now(), words: [...unique.values()] }); currentBookId = id; persist(); currentView = "home"; renderShell(); toast(`已导入 ${unique.size} 个词条${skipped ? `，跳过 ${skipped} 个无效词条` : ""}`);
+    state.books.push({ id, name: clampText(imported.name) || "导入词书", category: "导入", createdAt: Date.now(), words: [...unique.values()] }); currentBookId = id; persist(); currentView = "home"; renderShell(); toast(`已导入 ${unique.size} 个词条${skipped ? `，跳过 ${skipped} 个无效词条` : ""}`);
   } catch (error) { showModal("导入失败", error.message || "无法读取该文件"); }
 }
 function showModal(title, message, confirmLabel = "关闭", onConfirm, cancelLabel = "取消") {
-  const backdrop = document.createElement("div"); backdrop.className = "modal-backdrop"; backdrop.innerHTML = `<div class="modal"><h2>${escapeHtml(title)}</h2><p>${escapeHtml(message)}</p><div class="modal-actions"><button class="secondary-button" data-modal-cancel>${escapeHtml(cancelLabel)}</button><button class="primary-button" data-modal-confirm>${escapeHtml(confirmLabel)}</button></div></div>`;
-  document.body.append(backdrop); backdrop.addEventListener("click", event => { if (event.target === backdrop || event.target.closest("[data-modal-cancel]")) backdrop.remove(); if (event.target.closest("[data-modal-confirm]")) { backdrop.remove(); onConfirm?.(); } });
+  const backdrop = document.createElement("div");
+  backdrop.className = "modal-backdrop";
+  const cancelButton = `<button class="secondary-button" data-modal-cancel>${escapeHtml(cancelLabel)}</button>`;
+  const confirmButton = `<button class="primary-button" data-modal-confirm>${escapeHtml(confirmLabel)}</button>`;
+  const body = `<div class="modal"><h2>${escapeHtml(title)}</h2><p>${escapeHtml(message)}</p><div class="modal-actions">${cancelButton}${confirmButton}</div></div>`;
+  backdrop.innerHTML = body;
+  document.body.append(backdrop);
+  backdrop.addEventListener("click", event => {
+    if (event.target === backdrop || event.target.closest("[data-modal-cancel]")) backdrop.remove();
+    if (event.target.closest("[data-modal-confirm]")) { backdrop.remove(); onConfirm?.(); }
+  });
 }
 function startFromSelectedScope() {
   const book = currentBook();
@@ -1236,15 +1822,21 @@ function startFromSelectedScope() {
 }
 function speak(text) { if ("speechSynthesis" in window) { window.speechSynthesis.cancel(); const utter = new SpeechSynthesisUtterance(text); utter.lang = state.settings.accent === "us" ? "en-US" : "en-GB"; window.speechSynthesis.speak(utter); } else toast("此浏览器不支持系统语音"); }
 function stopAudio() { if (listen.audio) { listen.audio.pause(); listen.audio = null; } }
+// Word-level mp3 audio is not distributed with this project (see loadIeltsBook),
+// so remember URLs that failed: without this the same 404 was re-requested on
+// every card, delaying the speech-synthesis fallback by a network round trip.
+const missingAudio = new Set();
 function playAudio(word) {
   if (!word) return;
   stopAudio();
-  if (word.audio) {
-    const audio = new Audio(word.audio);
-    listen.audio = audio;
-    audio.onended = () => { if (listen.playing && currentView === "listen") listenNext(true); };
-    audio.play().catch(() => speak(word.word.split(" / ")[0]));
-  } else speak(word.word.split(" / ")[0]);
+  const source = wordAudioPath(word);
+  const spoken = String(word.word).split(" / ")[0];
+  if (!source || missingAudio.has(source)) { speak(spoken); return; }
+  const audio = new Audio(source);
+  listen.audio = audio;
+  audio.onended = () => { if (listen.playing && currentView === "listen") listenNext(true); };
+  audio.play().catch(() => { missingAudio.add(source); speak(spoken); });
+  audio.onerror = () => { missingAudio.add(source); };
 }
 function playWord(wordText) { const word = findWord(wordText); if (word) playAudio(word); else speak(wordText); }
 function listenNext(auto) {
@@ -1257,6 +1849,20 @@ function toggleListenPlay() {
   const book = currentBook(); if (!book) return;
   if (listen.playing) { listen.playing = false; stopAudio(); }
   else { listen.playing = true; playAudio(book.words[listen.index]); }
+  renderListen();
+}
+// Cycle the sleep timer: off → 15 → 30 → 60 minutes, restarting the countdown.
+function cycleSleepTimer() {
+  const values = [0, 15, 30, 60];
+  listen.sleepMinutes = values[(values.indexOf(listen.sleepMinutes) + 1) % values.length];
+  clearTimeout(listen.sleepTimer);
+  if (listen.sleepMinutes) {
+    listen.sleepTimer = setTimeout(() => {
+      listen.playing = false;
+      stopAudio();
+      renderListen();
+    }, listen.sleepMinutes * 60000);
+  }
   renderListen();
 }
 function toggleFavWord(word, bookId = bookIdFor(word)) {
@@ -1285,9 +1891,19 @@ function toggleLike(word, bookId = bookIdFor(word)) {
   persist();
   if (session) renderSession();
 }
+// A favourite sentence is identified by word + the first 24 chars of its example,
+// because one word can carry several examples across editions.
+function favoriteSentenceId(bookId, word) {
+  return `${recordKey(bookId, word)}|${String(word.example || "").slice(0, 24)}`;
+}
+function isFavoriteSentence(word, bookId = bookIdFor(word)) {
+  if (!word?.example) return false;
+  const id = favoriteSentenceId(bookId, word);
+  return state.favoriteSentences.some(item => item.id === id);
+}
 function toggleFavSentence(word, bookId = bookIdFor(word)) {
   if (!word.example) return toast("此词条没有例句");
-  const id = `${recordKey(bookId, word)}|${word.example.slice(0, 24)}`;
+  const id = favoriteSentenceId(bookId, word);
   const index = state.favoriteSentences.findIndex(item => item.id === id);
   if (index >= 0) { state.favoriteSentences.splice(index, 1); toast("已取消收藏例句"); }
   else { state.favoriteSentences.push({ id, word: word.word, sentence: word.example, translation: word.translation || "", source: word.category || "" }); toast("已收藏例句"); }
@@ -1301,7 +1917,9 @@ function toggleCheckin() {
 
 document.addEventListener("click", event => {
   const windowCommand = event.target.closest("[data-window]")?.dataset.window;
-  if (windowCommand) window.ipc?.postMessage(`window:${windowCommand}`);
+  // "drag" is driven from mousedown (see the listener above); re-sending it on
+  // click would ask the shell to start a drag after the button was released.
+  if (windowCommand && windowCommand !== "drag") window.ipc?.postMessage(`window:${windowCommand}`);
   const scopeField = event.target.closest("[data-scope]");
   if (scopeField && !event.target.closest("[data-step]")) return;
   if (event.target.closest("#sidebar-toggle")) {
@@ -1363,15 +1981,32 @@ document.addEventListener("click", event => {
   if (action === "like") { const word = currentSessionWord(); if (word) toggleLike(word); }
   if (action === "known") { const word = currentSessionWord(); if (word) toggleKnown(word); }
   if (action === "known-word") { const word = findWord(event.target.closest("[data-word]").dataset.word); if (word) toggleKnown(word); }
-  if (action === "gen-note") { const word = currentSessionWord(); if (word) { const draft = generatedNote(word, bookIdFor(word)); session.noteDraft = draft; state.notes[recordKey(bookIdFor(word), word)] = draft; persist(); const input = document.getElementById("note-input"); if (input) input.value = draft; toast("已生成参考笔记，可继续编辑"); } }
-  if (action === "fav-sentence") { const word = currentSessionWord(); if (word) toggleFavSentence(word); }
+  if (action === "gen-note") {
+    const word = currentSessionWord();
+    if (word) {
+      const draft = generatedNote(word, bookIdFor(word));
+      session.noteDraft = draft;
+      state.notes[recordKey(bookIdFor(word), word)] = draft;
+      persist();
+      const input = document.getElementById("note-input");
+      if (input) input.value = draft;
+      toast("已生成参考笔记，可继续编辑");
+    }
+  }
+  if (action === "fav-sentence") {
+    // Works from a study card and from the dictionary detail pane.
+    const word = currentSessionWord() || (dictSelected ? findWord(dictSelected) : null);
+    if (word) {
+      toggleFavSentence(word);
+      if (currentView === "dict") renderDict(); else renderSession();
+    }
+  }
   if (action === "unfav-sentence") { const id = event.target.closest("[data-key]").dataset.key; state.favoriteSentences = state.favoriteSentences.filter(item => item.id !== id); persist(); renderSentences(); }
   if (action === "play-audio") { const word = currentSessionWord(); if (word) playAudio(word); }
   if (action === "play-word") playWord(event.target.closest("[data-word]").dataset.word);
   if (action === "checkin") toggleCheckin();
   if (action === "open-favorites") { wordFilter = "fav"; currentView = "words"; renderShell(); }
   if (action === "toggle-accent") { state.settings.accent = state.settings.accent === "uk" ? "us" : "uk"; persist(); if (session) renderSession(); else renderShell(); }
-  if (action === "toggle-font") { state.settings.fontStyle = state.settings.fontStyle === "sans" ? "serif" : "sans"; persist(); applyTheme(); renderAppearance(); }
   if (action === "order-open") { orderOpen = !orderOpen; renderSettings(); }
   if (action === "order-move") {
     const index = Number(event.target.closest("[data-index]").dataset.index);
@@ -1381,13 +2016,40 @@ document.addEventListener("click", event => {
     if (swap >= 0 && swap < order.length) { [order[index], order[swap]] = [order[swap], order[index]]; state.settings.mnemonicOrder = order; persist(); }
     renderSettings();
   }
-  if (action === "delete-book") { const bookId = event.target.closest("[data-book]").dataset.book; showModal("删除本地词书？", "该词书及其本设备上的学习进度都会删除。此操作无法撤销。", "删除", () => { state.books = state.books.filter(book => book.id !== bookId); delete state.reviews[bookId]; Object.keys(state.records).filter(key => key.startsWith(`${bookId}:`)).forEach(key => delete state.records[key]); currentBookId = state.books[0]?.id || null; persist(); renderShell(); }); }
-  if (action === "review-single") { const book = state.books.find(item => item.id === event.target.closest("[data-book]").dataset.book); const word = book?.words.find(item => item.word === event.target.closest("[data-word]").dataset.word);     if (word) { session = createSession("review", [word], book.id, book.id); currentView = "review"; prepareWord(); renderShell(); renderSession(); } }
+  if (action === "delete-book") {
+    const bookId = event.target.closest("[data-book]").dataset.book;
+    showModal("删除本地词书？", "该词书及其本设备上的学习进度都会删除。此操作无法撤销。", "删除", () => {
+      state.books = state.books.filter(book => book.id !== bookId);
+      delete state.reviews[bookId];
+      Object.keys(state.records).filter(key => key.startsWith(`${bookId}:`)).forEach(key => delete state.records[key]);
+      currentBookId = state.books[0]?.id || null;
+      persist();
+      renderShell();
+    });
+  }
+  if (action === "review-single") {
+    const bookId = event.target.closest("[data-book]").dataset.book;
+    const text = event.target.closest("[data-word]").dataset.word;
+    const book = state.books.find(item => item.id === bookId);
+    const word = book?.words.find(item => item.word === text);
+    if (word) {
+      session = createSession("review", [word], book.id, book.id);
+      currentView = "review";
+      prepareWord();
+      renderShell();
+      renderSession();
+    }
+  }
   if (action === "listen-prev") { const book = currentBook(); if (book) { listen.index = (listen.index - 1 + book.words.length) % book.words.length; renderListen(); if (listen.playing) playAudio(book.words[listen.index]); } }
   if (action === "listen-next") listenNext(false);
   if (action === "listen-play") toggleListenPlay();
-  if (action === "listen-sleep") { const values = [0, 15, 30, 60]; listen.sleepMinutes = values[(values.indexOf(listen.sleepMinutes) + 1) % values.length]; clearTimeout(listen.sleepTimer); if (listen.sleepMinutes) listen.sleepTimer = setTimeout(() => { listen.playing = false; stopAudio(); renderListen(); }, listen.sleepMinutes * 60000); renderListen(); }
-  if (action === "listen-jump") { const index = Number(event.target.closest("[data-index]").dataset.index); listen.index = index; renderListen(); if (listen.playing) playAudio(currentBook().words[index]); }
+  if (action === "listen-sleep") cycleSleepTimer();
+  if (action === "listen-jump") {
+    const index = Number(event.target.closest("[data-index]").dataset.index);
+    listen.index = index;
+    renderListen();
+    if (listen.playing) playAudio(currentBook().words[index]);
+  }
   if (action === "load-listening") loadListeningData();
   if (action === "listening-play") playListeningAudio();
   if (action === "listening-play-one") playListeningAudio({ word: event.target.closest("[data-word]").dataset.word });
@@ -1395,7 +2057,16 @@ document.addEventListener("click", event => {
   if (action === "listening-check") checkListening();
   if (action === "listening-prev") nextListening(-1);
   if (action === "listening-next") nextListening(1);
-  if (action === "listening-jump") { listeningState.index = Number(event.target.closest("[data-index]").dataset.index); state.listening.index = listeningState.index; listeningState.revealed = false; listeningState.result = null; listeningState.typedWord = ""; listeningState.typedSyn = ""; persist(); renderListening(); }
+  if (action === "listening-jump") {
+    listeningState.index = Number(event.target.closest("[data-index]").dataset.index);
+    state.listening.index = listeningState.index;
+    listeningState.revealed = false;
+    listeningState.result = null;
+    listeningState.typedWord = "";
+    listeningState.typedSyn = "";
+    persist();
+    renderListening();
+  }
   const themeButton = event.target.closest("[data-theme-set]"); if (themeButton) { state.settings.theme = themeButton.dataset.themeSet; state.settings.followSystem = false; persist(); applyTheme(); renderAppearance(); }
   const filterTab = event.target.closest("[data-filter-tab]"); if (filterTab) { wordFilter = filterTab.dataset.filterTab; renderWords(); }
   const dictTabButton = event.target.closest("[data-dict-tab]"); if (dictTabButton) { dictTab = dictTabButton.dataset.dictTab; renderDict(); }
@@ -1558,6 +2229,7 @@ document.addEventListener("keydown", event => {
 });
 applyTheme();
 applySidebar();
+applyNativeChrome();
 renderShell();
 loadDatabaseState().then(() => {
   loadIeltsBook();

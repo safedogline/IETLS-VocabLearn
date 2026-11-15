@@ -1,8 +1,8 @@
-﻿#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -79,10 +79,19 @@ struct Bounds {
     y: i32,
 }
 
+/// Keep the log from growing without bound: the page reports its glass state on
+/// every theme change, so a long-lived install writes a lot of small lines.
+const LOG_ROTATE_BYTES: u64 = 512 * 1024;
+
 fn log(message: &str) {
     if let Some(path) = config_dir().map(|dir| dir.join("main.log")) {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
+        }
+        if fs::metadata(&path).map(|meta| meta.len() > LOG_ROTATE_BYTES).unwrap_or(false) {
+            let previous = path.with_extension("log.1");
+            let _ = fs::remove_file(&previous);
+            let _ = fs::rename(&path, &previous);
         }
         if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
             let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|value| value.as_secs()).unwrap_or(0);
@@ -131,6 +140,43 @@ fn load_bounds() -> Option<Bounds> {
         return None;
     }
     Some(bounds)
+}
+
+/// A saved position can point at a monitor that is no longer connected (external
+/// display unplugged, resolution changed, remote session). Left alone the window
+/// would be restored entirely off-screen and the app would look like it failed to
+/// launch, so pull it back onto whichever monitor is now available.
+fn ensure_window_on_screen(window: &tao::window::Window) {
+    let Ok(position) = window.outer_position() else { return };
+    let size = window.outer_size();
+    let overlaps = |monitor: &tao::monitor::MonitorHandle| {
+        let monitor_position = monitor.position();
+        let monitor_size = monitor.size();
+        let left = position.x.max(monitor_position.x);
+        let top = position.y.max(monitor_position.y);
+        let right = (position.x + size.width as i32).min(monitor_position.x + monitor_size.width as i32);
+        let bottom = (position.y + size.height as i32).min(monitor_position.y + monitor_size.height as i32);
+        // Require a grabbable strip, not just a single pixel of overlap.
+        right - left >= 120 && bottom - top >= 60
+    };
+    if window.available_monitors().any(|monitor| overlaps(&monitor)) {
+        return;
+    }
+    let target = window
+        .primary_monitor()
+        .or_else(|| window.current_monitor())
+        .or_else(|| window.available_monitors().next());
+    if let Some(monitor) = target {
+        let monitor_position = monitor.position();
+        let monitor_size = monitor.size();
+        let x = monitor_position.x + ((monitor_size.width as i32 - size.width as i32) / 2).max(0);
+        let y = monitor_position.y + ((monitor_size.height as i32 - size.height as i32) / 2).max(0);
+        window.set_outer_position(PhysicalPosition::new(x, y));
+        log(&format!("window was off-screen at {},{}, re-centred to {x},{y}", position.x, position.y));
+    } else {
+        window.set_outer_position(PhysicalPosition::new(80, 80));
+        log("window was off-screen and no monitor was reported, moved to 80,80");
+    }
 }
 
 fn save_bounds(bounds: Bounds) {
@@ -209,6 +255,121 @@ fn header(name: &str, value: &str) -> Header {
     Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("valid header")
 }
 
+fn header_value(request: &tiny_http::Request, name: &str) -> Option<String> {
+    // `Header::equiv` requires a `&'static str`, so compare by value instead.
+    request
+        .headers()
+        .iter()
+        .find(|item| item.field.as_str().as_str().eq_ignore_ascii_case(name))
+        .map(|item| item.value.as_str().to_string())
+}
+
+/// Outcome of inspecting a `Range` header.
+enum RangeSpec {
+    /// Serve this inclusive byte span as 206.
+    Satisfiable(u64, u64),
+    /// Ignore the header and send the whole file with 200. Used for multi-range
+    /// requests, which are legal to answer with the full entity, and for headers
+    /// this server does not understand.
+    Ignore,
+    /// The client asked for bytes that do not exist; RFC 7233 requires 416 plus
+    /// `Content-Range: bytes */total`. Answering 200 here would make a media
+    /// element treat a truncated file as complete.
+    Unsatisfiable,
+}
+
+/// Parse a single `bytes=start-end` range.
+///
+/// Multi-range requests deliberately fall back to the whole file: returning 200
+/// for a request we do not fully understand is always legal, and the only media
+/// user here is an `<audio>` element that issues single ranges.
+fn parse_range(value: &str, total: u64) -> RangeSpec {
+    let Some(spec) = value.strip_prefix("bytes=") else {
+        return RangeSpec::Ignore;
+    };
+    let spec = spec.trim();
+    if spec.contains(',') {
+        return RangeSpec::Ignore;
+    }
+    if total == 0 {
+        return RangeSpec::Unsatisfiable;
+    }
+    let Some((start, end)) = spec.split_once('-') else {
+        return RangeSpec::Ignore;
+    };
+    let (start, end) = (start.trim(), end.trim());
+    if start.is_empty() {
+        // Suffix range: the last N bytes.
+        let Ok(length) = end.parse::<u64>() else {
+            return RangeSpec::Ignore;
+        };
+        if length == 0 {
+            return RangeSpec::Unsatisfiable;
+        }
+        let length = length.min(total);
+        return RangeSpec::Satisfiable(total - length, total - 1);
+    }
+    let Ok(start) = start.parse::<u64>() else {
+        return RangeSpec::Ignore;
+    };
+    if start >= total {
+        return RangeSpec::Unsatisfiable;
+    }
+    let end = if end.is_empty() {
+        total - 1
+    } else {
+        match end.parse::<u64>() {
+            Ok(value) => value.min(total - 1),
+            Err(_) => return RangeSpec::Ignore,
+        }
+    };
+    if end < start {
+        return RangeSpec::Unsatisfiable;
+    }
+    RangeSpec::Satisfiable(start, end)
+}
+
+/// Headers sent with every response. The app is a loopback-only personal tool,
+/// but a permissive document policy still matters because it can render user
+/// supplied vocabulary files, so lock it down to what the page actually needs.
+fn document_headers() -> Vec<Header> {
+    vec![
+        header("X-Content-Type-Options", "nosniff"),
+        header("Referrer-Policy", "no-referrer"),
+        header("X-Frame-Options", "DENY"),
+        header(
+            "Content-Security-Policy",
+            "default-src 'self'; \
+             script-src 'self'; \
+             style-src 'self' 'unsafe-inline'; \
+             img-src 'self' data: blob:; \
+             media-src 'self' data: blob: https:; \
+             font-src 'self'; \
+             connect-src 'self'; \
+             object-src 'none'; \
+             base-uri 'none'; \
+             form-action 'none'; \
+             frame-ancestors 'none'",
+        ),
+    ]
+}
+
+fn with_common_headers(mut response: Response<std::fs::File>) -> Response<std::fs::File> {
+    for item in document_headers() {
+        response.add_header(item);
+    }
+    response
+}
+
+fn plain_error(status: u16, body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+    let mut response = Response::from_string(body.to_string()).with_status_code(status);
+    response.add_header(header("Content-Type", "text/plain; charset=utf-8"));
+    for item in document_headers() {
+        response.add_header(item);
+    }
+    response
+}
+
 fn start_server(root: PathBuf, database: Option<PathBuf>) -> std::io::Result<u16> {
     let mut last_error = String::from("no free local port");
     for port in 47800u16..47820 {
@@ -223,82 +384,147 @@ fn start_server(root: PathBuf, database: Option<PathBuf>) -> std::io::Result<u16
     Err(std::io::Error::new(std::io::ErrorKind::AddrInUse, last_error))
 }
 
+/// Serve one state-database request (`GET` or `PUT /__ielts_state`).
+fn respond_state(mut request: tiny_http::Request, database: &Path) {
+    let method = request.method().as_str().to_string();
+    match method.as_str() {
+        "GET" => {
+            let response = match load_database_state(database) {
+                Some(state) => {
+                    let mut response = Response::from_string(state);
+                    response.add_header(header("Content-Type", "application/json; charset=utf-8"));
+                    response.add_header(header("Cache-Control", "no-store"));
+                    response
+                }
+                None => Response::from_data(Vec::new()).with_status_code(204),
+            };
+            let _ = request.respond(response);
+        }
+        "PUT" => {
+            // The state blob is a local study database of a few megabytes; cap it
+            // so a stuck client cannot make the shell allocate without bound.
+            const MAX_STATE_BYTES: u64 = 64 * 1024 * 1024;
+            let mut body = String::new();
+            let result = request
+                .as_reader()
+                .take(MAX_STATE_BYTES)
+                .read_to_string(&mut body)
+                .and_then(|_| save_database_state(database, &body).map_err(std::io::Error::other));
+            let response = match result {
+                Ok(()) => Response::from_data(b"ok".to_vec()).with_header(header("Content-Type", "text/plain")),
+                Err(error) => {
+                    log(&format!("database save error: {error}"));
+                    plain_error(500, "database error")
+                }
+            };
+            let _ = request.respond(response);
+        }
+        _ => {
+            let _ = request.respond(plain_error(405, "Method not allowed"));
+        }
+    }
+}
+
+/// Serve one static file, honouring `Range` so audio playback can seek.
+fn respond_file(request: tiny_http::Request, file_path: &Path) {
+    let content_type = mime_for(file_path);
+    let total = fs::metadata(file_path).map(|meta| meta.len()).unwrap_or(0);
+    let is_head = request.method().as_str().eq_ignore_ascii_case("HEAD");
+
+    if is_head {
+        let mut response = Response::empty(200);
+        response.add_header(header("Content-Type", content_type));
+        response.add_header(header("Content-Length", &total.to_string()));
+        response.add_header(header("Accept-Ranges", "bytes"));
+        response.add_header(header("Cache-Control", "no-cache"));
+        for item in document_headers() {
+            response.add_header(item);
+        }
+        let _ = request.respond(response);
+        return;
+    }
+
+    let range = header_value(&request, "range")
+        .map(|value| parse_range(&value, total))
+        .unwrap_or(RangeSpec::Ignore);
+
+    if let RangeSpec::Unsatisfiable = range {
+        let mut response = plain_error(416, "Requested range not satisfiable");
+        response.add_header(header("Content-Range", &format!("bytes */{total}")));
+        response.add_header(header("Accept-Ranges", "bytes"));
+        let _ = request.respond(response);
+        return;
+    }
+
+    let Ok(mut file) = File::open(file_path) else {
+        log(&format!("open error {}", file_path.display()));
+        let _ = request.respond(plain_error(404, "Not found"));
+        return;
+    };
+
+    match range {
+        RangeSpec::Satisfiable(start, end) => {
+            if file.seek(std::io::SeekFrom::Start(start)).is_err() {
+                let _ = request.respond(plain_error(500, "seek failed"));
+                return;
+            }
+            let length = end - start + 1;
+            let mut response = Response::new(
+                tiny_http::StatusCode(206),
+                Vec::new(),
+                file.take(length),
+                Some(length as usize),
+                None,
+            );
+            response.add_header(header("Content-Type", content_type));
+            response.add_header(header("Accept-Ranges", "bytes"));
+            response.add_header(header("Content-Range", &format!("bytes {start}-{end}/{total}")));
+            response.add_header(header("Cache-Control", "no-cache"));
+            for item in document_headers() {
+                response.add_header(item);
+            }
+            let _ = request.respond(response);
+        }
+        RangeSpec::Ignore => {
+            let mut response = with_common_headers(Response::from_file(file));
+            response.add_header(header("Content-Type", content_type));
+            response.add_header(header("Accept-Ranges", "bytes"));
+            response.add_header(header("Cache-Control", "no-cache"));
+            let _ = request.respond(response);
+        }
+        // Handled above, before the file is opened.
+        RangeSpec::Unsatisfiable => {}
+    }
+}
+
 fn serve_in_background(server: Server, root: PathBuf, database: Option<PathBuf>) {
     let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
     thread::spawn(move || {
-        for mut request in server.incoming_requests() {
+        for request in server.incoming_requests() {
             let raw_path = request.url().split('?').next().unwrap_or("/");
             let decoded = percent_decode(raw_path);
             let relative = if decoded == "/" { "/index.html".to_string() } else { decoded };
+
             if relative == "/__ielts_health" {
-                let response = Response::from_data(b"ielts-vocab-health".to_vec())
-                    .with_header(header("Content-Type", "text/plain"));
-                let _ = request.respond(response);
+                let _ = request.respond(Response::from_data(b"ielts-vocab-health".to_vec()).with_header(header("Content-Type", "text/plain")));
                 continue;
             }
             if relative == "/__ielts_state" {
-                let Some(path) = database.as_ref() else {
-                    let _ = request.respond(Response::from_data(b"Not found".to_vec()).with_status_code(404));
-                    continue;
-                };
-                match request.method().as_str() {
-                    "GET" => {
-                        let response = match load_database_state(path) {
-                            Some(state) => Response::from_string(state).with_header(header("Content-Type", "application/json; charset=utf-8")),
-                            None => Response::from_data(Vec::new()).with_status_code(204),
-                        };
-                        let _ = request.respond(response);
+                match database.as_ref() {
+                    Some(path) => respond_state(request, path),
+                    None => {
+                        let _ = request.respond(plain_error(404, "Not found"));
                     }
-                    "PUT" => {
-                        let mut body = String::new();
-                        let result = request.as_reader().read_to_string(&mut body).and_then(|_| save_database_state(path, &body).map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error)));
-                        let response = match result {
-                            Ok(()) => Response::from_data(b"ok".to_vec()).with_header(header("Content-Type", "text/plain")),
-                            Err(error) => {
-                                log(&format!("database save error: {error}"));
-                                Response::from_data(b"database error".to_vec()).with_status_code(500)
-                            }
-                        };
-                        let _ = request.respond(response);
-                    }
-                    _ => { let _ = request.respond(Response::from_data(b"Method not allowed".to_vec()).with_status_code(405)); }
                 }
                 continue;
             }
+
             let candidate = root.join(relative.trim_start_matches('/'));
             let resolved = candidate.canonicalize();
-            let file_path = match resolved {
-                Ok(path) if path.starts_with(&canonical_root) && path.is_file() => path,
+            match resolved {
+                Ok(path) if path.starts_with(&canonical_root) && path.is_file() => respond_file(request, &path),
                 _ => {
-                    let body = b"Not found".to_vec();
-                    let response = Response::from_data(body)
-                        .with_status_code(404)
-                        .with_header(header("Content-Type", "text/plain; charset=utf-8"));
-                    let _ = request.respond(response);
-                    continue;
-                }
-            };
-            let content_type = mime_for(&file_path);
-            let is_head = request.method().as_str().eq_ignore_ascii_case("HEAD");
-            if is_head {
-                let size = fs::metadata(&file_path).map(|meta| meta.len()).unwrap_or(0);
-                let response = Response::empty(200)
-                    .with_header(header("Content-Type", content_type))
-                    .with_header(header("Content-Length", &size.to_string()))
-                    .with_header(header("Cache-Control", "no-cache"));
-                let _ = request.respond(response);
-                continue;
-            }
-            match File::open(&file_path) {
-                Ok(file) => {
-                    let response = Response::from_file(file)
-                        .with_header(header("Content-Type", content_type))
-                        .with_header(header("Cache-Control", "no-cache"));
-                    let _ = request.respond(response);
-                }
-                Err(error) => {
-                    log(&format!("open error {}: {}", file_path.display(), error));
-                    let _ = request.respond(Response::from_data(b"Not found".to_vec()).with_status_code(404));
+                    let _ = request.respond(plain_error(404, "Not found"));
                 }
             }
         }
@@ -419,6 +645,10 @@ fn main() -> wry::Result<()> {
         None => window_builder.with_inner_size(default_window_size(&event_loop)),
     };
     let window = window_builder.build(&event_loop).expect("failed to create window");
+    if bounds.is_some() {
+        // Only a restored position can be stale; a fresh default window is fine.
+        ensure_window_on_screen(&window);
+    }
     #[cfg(windows)]
     let composition_host = create_composition_host(window.hwnd()).expect("failed to create DirectComposition host");
     let webview = if let Some(root) = find_root() {

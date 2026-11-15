@@ -1,9 +1,13 @@
-﻿<!doctype html>
+<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#141722">
+  <!-- Mirrors the CSP the desktop server sends. frame-ancestors is omitted
+       because browsers ignore it in a meta tag; the Rust server sets it as a
+       response header for the desktop build. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' data: blob: https:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
   <title>IELTS 词汇</title>
   <link rel="stylesheet" href="./styles.css">
 </head>
@@ -11,7 +15,15 @@
   <div class="app-shell">
     <aside class="sidebar">
       <div class="brand-row">
-        <a class="brand" href="#home" aria-label="首页"><span class="brand-mark"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v18H6.5A2.5 2.5 0 0 1 4 18.5z"/><path d="M8 3v18"/></svg></span></a>
+        <a class="brand" href="#home" aria-label="首页">
+          <span class="brand-mark">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor"
+              stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v18H6.5A2.5 2.5 0 0 1 4 18.5z"/>
+              <path d="M8 3v18"/>
+            </svg>
+          </span>
+        </a>
         <button class="sidebar-toggle" id="sidebar-toggle" type="button" aria-label="收起侧栏">☰</button>
       </div>
       <div class="side-label">学习</div>
@@ -54,6 +66,18 @@
     </main>
   </div>
   <div id="toast" role="status" aria-live="polite"></div>
+  <!-- Frameless-window controls. The desktop build has no OS title bar, so
+       without this strip the only way to close the window was 设置 → 窗口操作,
+       and the only way to move it was holding Alt. Hidden in the browser build
+       (app.js sets body[data-native]) so the web UI keeps its layout. -->
+  <div class="window-bar" id="window-bar" aria-hidden="true">
+    <button class="window-grip" type="button" data-window="drag" tabindex="-1" aria-label="拖动窗口" title="按住拖动窗口">⠿</button>
+    <div class="window-bar-actions">
+      <button class="window-button" type="button" data-window="minimize" tabindex="-1" aria-label="最小化" title="最小化">–</button>
+      <button class="window-button" type="button" data-window="maximize" tabindex="-1" aria-label="最大化" title="最大化 / 还原">□</button>
+      <button class="window-button window-close" type="button" data-window="close" tabindex="-1" aria-label="关闭" title="关闭">×</button>
+    </div>
+  </div>
   <dialog id="help-dialog">
     <form method="dialog" class="dialog-content">
       <div class="dialog-header"><h2>导入词书</h2><button class="icon-button" aria-label="关闭">×</button></div>
