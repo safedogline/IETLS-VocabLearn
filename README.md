@@ -110,9 +110,11 @@ cd desktop-rs && cargo build --release
 1. **CSS 分层半透明**：`body[data-glass="on"]` 用 `color-mix(in srgb, var(--bg) var(--glass-alpha), transparent)` 把底色按透明度混成半透明，卡片、侧栏再各自叠一层。`--glass-alpha` 由设置里的滑块驱动。
 2. **窗口不绘制任何东西**：`.with_no_redirection_bitmap(true)` 去掉窗口的重定向位图（`WS_EX_NOREDIRECTIONBITMAP`），桌面于是能直接透过来。
 3. **不能用 DWM**：WebView2 会渲染进自己那个不透明的子窗口，`DwmEnableBlurBehindWindow` 之类的系统毛玻璃永远看不到网页内容——历史上的三次尝试都返回 `S_OK` 但毫无效果。
-4. **DirectComposition 托管**：`desktop-rs/vendor/` 里有一份改过的 wry，用 `CreateCoreWebView2CompositionController` 把网页托管到一个 `IDCompositionVisual` 上，窗口在 Win32 消息里接收输入再转交给它。
+4. **DirectComposition 托管**：`desktop-rs/vendor/` 里有一份改过的 wry，用 `CreateCoreWebView2CompositionController` 把网页托管到一个 `IDCompositionVisual` 上，窗口在 Win32 消息里接收输入再转交给它。改动的核心在 `src/webview2/composition.rs`，`mod.rs` 里把它接上。
 
 所以 `desktop-rs/vendor/wry-*` 这个目录必须留在仓库里，也不能换成 crates.io 上的 wry：上游至今没有 composition 支持。
+vendor 里只保留了编译要用的东西——`Cargo.toml`、`build.rs`、`src/`、许可证和 `.cargo/config.toml`；
+上游的文档、示例、CI 配置、基准测试和 CHANGELOG 都删掉了，那是原项目的东西，跟这个应用无关。要对照上游实现请去看 crates.io 上的 `wry 0.55.1`。
 
 ## 日常命令
 
