@@ -15,7 +15,7 @@ body{font-size:calc(14px + var(--global-font-size))}
 body[data-theme="light"]{
   --bg:#f2f1ec;--bg-2:#f7f6f2;--surface:#ffffff;--surface-2:#f6f5f0;--surface-3:#efece4;
   --line:#e4e1d8;--text:#23262e;--muted:#767d8c;--dim:#9aa0ac;
-  --gold:#e8b04b;--gold-2:#f0c469;--gold-soft:rgba(232,176,75,.14);
+  --gold:#c2903a;--gold-2:#8a6a24;--gold-soft:rgba(232,176,75,.14);
   --blue:#3f6fd0;--blue-soft:rgba(63,111,208,.12);
   --red:#bf5b5b;--red-soft:rgba(191,91,91,.12);
 }
@@ -266,6 +266,10 @@ body[data-theme="night"] .learn-card{background:
 .choice-option.correct{border-color:var(--blue);background:var(--blue-soft);color:#cfe0ff}
 .choice-option.wrong{border-color:var(--red);background:var(--red-soft);color:#f2c9c9}
 .choice-option.inspect{border-color:var(--gold);background:var(--gold-soft);color:var(--gold-2)}
+/* An opened option is a third state next to right and wrong; the word it reveals
+   is the whole point of the click, so it gets the accent and full opacity. */
+.choice-option.inspect .choice-word{color:var(--gold-2);font-weight:600}
+.choice-option.inspect .choice-meaning{opacity:1}
 body[data-theme="light"] .choice-option.correct{color:#1d3f7a}
 body[data-theme="light"] .choice-option.wrong{color:#7c2b2b}
 .choice-word{font-weight:400;min-height:1.5em;color:inherit;text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}

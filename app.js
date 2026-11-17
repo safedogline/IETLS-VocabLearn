@@ -1007,7 +1007,9 @@ function renderChoice() {
     if (locked) {
       if (option.correct) cls += " correct";
       else if (choice.selected === index) cls += " wrong";
-      else if (inspected.includes(index)) cls += " inspect";
+      // Gold means "opened to peek at the word"; a corrected pick keeps its own
+      // colour so the button that was pressed stays identifiable.
+      if (inspected.includes(index) && !option.correct && choice.selected !== index) cls += " inspect";
     }
     const showWord = locked && (option.correct || choice.selected === index || inspected.includes(index));
     return `<button class="${cls}" data-choice="${index}"><span class="choice-meaning">${escapeHtml(option.meaning)}</span><span class="choice-word">${showWord && option.word ? escapeHtml(option.word) : ""}</span></button>`;
@@ -1280,11 +1282,11 @@ function chooseOption(index) {
 function inspectChoice(index) {
   if (!session?.choice || !session.answered) return;
   if (!session.choice.options[index]) return;
+  // The correct option shows its word as soon as the answer is in, and the
+  // selected one is already on screen, so neither needs opening.
   if (index === session.choice.selected || session.choice.options[index].correct) return;
   const inspected = Array.isArray(session.choiceInspect) ? session.choiceInspect : (session.choiceInspect = []);
-  const selectedCorrect = session.choice.selected >= 0 && session.choice.options[session.choice.selected]?.correct;
-  const inspectLimit = selectedCorrect ? 3 : 2;
-  if (!inspected.includes(index) && inspected.length < inspectLimit) inspected.push(index);
+  if (!inspected.includes(index)) inspected.push(index);
   persist();
   renderSession();
 }
