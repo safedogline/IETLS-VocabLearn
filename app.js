@@ -892,6 +892,7 @@ function renderSession() {
   const toolbar = `<div class="learn-toolbar"><button data-action="exit-session">← 返回</button><span>${toolbarProgress}</span><span>${total - session.completed} 剩余</span></div>`;
   root.innerHTML = `<div class="learn-layout">${toolbar}
    <article class="learn-card ${revealed ? "answered" : "recalling"}"><div class="learn-progress"><span style="width:${progress}%"></span></div>
+  <div class="learn-body">
   ${topline}
    <h1 class="learn-word">${session.spelling ? "拼写测试" : listening ? "🎧 听音选义" : escapeHtml(displayWord)}</h1>
   ${!session.spelling && !listening && variants.length ? `<div class="word-variants">${variants.map(variant => `<span>${escapeHtml(variant)}</span>`).join("")}</div>` : ""}
@@ -899,12 +900,39 @@ function renderSession() {
    ${session.choice && !session.spelling ? `<div class="choice-stage"><div class="choice-prompt" ${revealed ? 'aria-hidden="true"' : ""}>${revealed || !listening ? "" : "听发音，选择对应词义"}</div>${!spellingResult ? renderChoice(word) : ""}</div>` : ""}
    ${(!session.choice || spellingResult) && revealed ? `<div class="word-meaning">${escapeHtml(meaningOf(word))}</div>` : ""}
   ${panels}
+  </div>
   <div class="answer-actions">${actions}</div>
    ${revealed && session.answerGrade === "unsure" ? '<div class="unsure-hint">模糊按“没记住”处理，这个词稍后会在本组再次出现。</div>' : ""}
    </article></div>`;
+   fitLearnCard();
+   watchLearnCard();
    normalizeChoiceHeights();
    if (session.spelling) setTimeout(() => document.getElementById("spell-input")?.focus(), 30);
  }
+// The card is content-sized so the four options and the answer bar stay in one
+// column, but it must never be taller than the space left under the window's own
+// chrome (drag bar, sidebar strip, toolbar). Measured rather than hard-coded:
+// those offsets differ per breakpoint and between the desktop shell and a browser.
+function fitLearnCard() {
+  const card = document.querySelector(".learn-card");
+  if (!card) return;
+  const available = Math.round(window.innerHeight - card.getBoundingClientRect().top - 8);
+  const next = available > 160 ? `${available}px` : "";
+  if (card.style.maxHeight !== next) card.style.maxHeight = next;
+}
+// The toolbar can wrap and the heading can shrink after the first paint, which
+// moves the card down a few pixels. Refitting on layout changes keeps the cap
+// true without measuring in a fixed timeout.
+let learnCardObserver = null;
+function watchLearnCard() {
+  if (typeof ResizeObserver === "undefined") return;
+  const card = document.querySelector(".learn-card");
+  learnCardObserver?.disconnect();
+  learnCardObserver = null;
+  if (!card?.parentElement) return;
+  learnCardObserver = new ResizeObserver(() => fitLearnCard());
+  learnCardObserver.observe(card.parentElement);
+}
 function normalizeChoiceHeights() {
   const list = document.querySelector(".choice-list");
   if (!list) return;
@@ -912,11 +940,17 @@ function normalizeChoiceHeights() {
   requestAnimationFrame(() => {
     const options = [...list.querySelectorAll(".choice-option")];
     if (!options.length) return;
-    const rowHeight = Math.max(48, ...options.map(option => {
+    // The stylesheet already encodes how tight a row may get at this window size
+    // (36px on narrow windows, 42px on short ones, 48px otherwise). Measure the
+    // content against that floor instead of a hard-coded 48, so all four options
+    // stay above the answer bar on a 350x450 window.
+    const floor = parseFloat(getComputedStyle(options[0]).minHeight) || 48;
+    const needed = Math.max(...options.map(option => {
       const content = option.querySelector(".choice-meaning");
       const style = getComputedStyle(option);
       return content.getBoundingClientRect().height + parseFloat(style.paddingTop) + parseFloat(style.paddingBottom) + 2;
     }));
+    const rowHeight = Math.ceil(Math.max(floor, needed));
     list.style.setProperty("--choice-row-height", `${rowHeight}px`);
   });
 }
@@ -2227,6 +2261,18 @@ document.addEventListener("keydown", event => {
   if (!session.answered && session.choice && /^[1-4]$/.test(event.key)) { event.preventDefault(); chooseOption(Number(event.key) - 1); }
   if (event.key === "Escape") exitSession();
 });
+/* The choice rows are sized from the text they hold, so a stale height would
+   survive a window resize and push the last option under the answer bar.
+   Re-measure (debounced) whenever the viewport changes. */
+let choiceResizeTimer = 0;
+window.addEventListener("resize", () => {
+  clearTimeout(choiceResizeTimer);
+  choiceResizeTimer = setTimeout(() => {
+    fitLearnCard();
+    normalizeChoiceHeights();
+  }, 120);
+});
+
 applyTheme();
 applySidebar();
 applyNativeChrome();
