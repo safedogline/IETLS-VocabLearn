@@ -71,7 +71,10 @@
        and the only way to move it was holding Alt. Hidden in the browser build
        (app.js sets body[data-native]) so the web UI keeps its layout. -->
   <div class="window-bar" id="window-bar" aria-hidden="true">
-    <button class="window-grip" type="button" data-window="drag" tabindex="-1" aria-label="拖动窗口" title="按住拖动窗口">⠿</button>
+    <div class="window-bar-start">
+      <button class="window-grip" type="button" data-window="drag" tabindex="-1" aria-label="拖动窗口" title="按住拖动窗口">⠿</button>
+      <button class="window-pin" type="button" data-action="pin-window" tabindex="-1" aria-pressed="false" aria-label="窗口置顶" title="固定在其它窗口之上">📌</button>
+    </div>
     <div class="window-bar-actions">
       <button class="window-button" type="button" data-window="minimize" tabindex="-1" aria-label="最小化" title="最小化">–</button>
       <button class="window-button" type="button" data-window="maximize" tabindex="-1" aria-label="最大化" title="最大化 / 还原">□</button>

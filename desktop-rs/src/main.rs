@@ -18,6 +18,8 @@ use rusqlite::{params, Connection};
 #[cfg(windows)]
 use tao::platform::windows::{WindowBuilderExtWindows, WindowExtWindows};
 #[cfg(windows)]
+use std::cell::Cell;
+#[cfg(windows)]
 use windows::{
     core::{IUnknown, Interface},
     Win32::{
@@ -26,6 +28,8 @@ use windows::{
         System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED},
     },
 };
+#[cfg(windows)]
+use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW};
 #[cfg(windows)]
 use wry::WebViewBuilderExtWindows;
 
@@ -65,11 +69,24 @@ enum WindowCommand {
     ToggleMaximize,
     Close,
     Drag,
+    /// Pin the window above every other window. Once pinned the shell drops the
+    /// taskbar button and refuses activation, so the pin button you press to
+    /// release it is the only thing still standing between the user and an
+    /// unreachable window - see `apply_always_on_top`.
+    SetAlwaysOnTop(bool),
+    /// Read back the pin state, because the page caches it in its settings and
+    /// has to agree with what the window manager actually applied.
+    QueryAlwaysOnTop,
+    /// Re-broadcast from the pin watcher thread while the pin is on.
+    EnsureAlwaysOnTop,
 }
 
 const APP_TITLE: &str = "IE";
 const MIN_WIDTH: f64 = 350.0;
 const MIN_HEIGHT: f64 = 450.0;
+/// How often a pinned window re-asserts itself. Fast enough to look instant when
+/// the user clicks another window, slow enough to cost nothing while idle.
+const PIN_POLL_MS: u64 = 700;
 
 #[derive(Serialize, Deserialize, Clone, Copy)]
 struct Bounds {
@@ -599,6 +616,35 @@ fn default_window_size<T: 'static>(event_loop: &EventLoop<T>) -> PhysicalSize<u3
     PhysicalSize::new(350, 450)
 }
 
+/// Pin or unpin the window, keeping it reachable either way.
+///
+/// A pinned window is raised with `HWND_TOPMOST`, but pinning also has to survive
+/// the user switching away from the app: while unpinned the shell hides the
+/// taskbar button and refuses focus, so a pinned window that nothing keeps on top
+/// could still end up stranded behind a maximised window with no way back.
+/// Applying `TOPMOST` on every pass re-raises the window and makes it visible
+/// again, which is exactly what the pin promises.
+fn apply_always_on_top(window: &tao::window::Window, always_on_top: bool) {
+    window.set_always_on_top(always_on_top);
+    #[cfg(windows)]
+    unsafe {
+        let hwnd = HWND(window.hwnd() as *mut _);
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        let next = if always_on_top {
+            // Pinned: keep the window out of the taskbar and out of the
+            // alt-tab list, and never steal focus when it re-raises itself.
+            style | WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0
+        } else {
+            // Unpinned: give the window its taskbar button back. Only the bits
+            // this function owns are cleared, everything else is left alone.
+            style & !(WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0)
+        };
+        if next != style {
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next as isize);
+        }
+    }
+}
+
 fn sync_webview_bounds(webview: &wry::WebView, width: u32, height: u32, scale: f64) {
     let _ = scale;
     let _ = webview.set_bounds(wry::Rect {
@@ -622,6 +668,12 @@ fn main() -> wry::Result<()> {
     let mut event_loop_builder = EventLoopBuilder::<WindowCommand>::with_user_event();
     let event_loop = event_loop_builder.build();
     let event_proxy = event_loop.create_proxy();
+    // The IPC handler takes ownership of `event_proxy`; the pin watcher thread
+    // needs its own handle on the same loop.
+    let outer_pin_proxy = event_proxy.clone();
+    // Tracks what the window manager was last told, so the watcher thread has
+    // something to poll and the page can ask for the truth on load.
+    let always_on_top = Cell::new(false);
     let bounds = load_bounds();
     let mut window_builder = WindowBuilder::new()
         .with_title(APP_TITLE)
@@ -677,6 +729,9 @@ fn main() -> wry::Result<()> {
                             "window:maximize" => Some(WindowCommand::ToggleMaximize),
                             "window:close" => Some(WindowCommand::Close),
                             "window:drag" => Some(WindowCommand::Drag),
+                            "window:pin-on" => Some(WindowCommand::SetAlwaysOnTop(true)),
+                            "window:pin-off" => Some(WindowCommand::SetAlwaysOnTop(false)),
+                            "window:pin-query" => Some(WindowCommand::QueryAlwaysOnTop),
                             _ => None,
                         }};
                         if let Some(event) = event {
@@ -736,6 +791,17 @@ fn main() -> wry::Result<()> {
 
     let initial_size = window.inner_size();
     sync_webview_bounds(&webview, initial_size.width, initial_size.height, window.scale_factor());
+    // The caller cannot supply a WndProc, so a pinned window would have no way to
+    // notice it is sinking behind another window. Watch for that instead and
+    // re-raise it; the poll is cheap and only runs while the pin is on.
+    #[cfg(windows)]
+    let pin_proxy = outer_pin_proxy;
+    thread::spawn(move || loop {
+        thread::sleep(std::time::Duration::from_millis(PIN_POLL_MS));
+        if pin_proxy.send_event(WindowCommand::EnsureAlwaysOnTop).is_err() {
+            break;
+        }
+    });
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
         match event {
@@ -753,6 +819,27 @@ fn main() -> wry::Result<()> {
                     const HTCAPTION: usize = 2;
                     ReleaseCapture();
                     SendMessageW(window.hwnd(), WM_NCLBUTTONDOWN, HTCAPTION, 0);
+                }
+            }
+            Event::UserEvent(WindowCommand::SetAlwaysOnTop(enabled)) => {
+                always_on_top.set(enabled);
+                apply_always_on_top(&window, enabled);
+                log(&format!("window pin enabled={enabled}"));
+                webview.evaluate_script(&format!(
+                    "window.__pinReport && window.__pinReport({});",
+                    if enabled { "true" } else { "false" }
+                )).ok();
+            }
+            Event::UserEvent(WindowCommand::QueryAlwaysOnTop) => {
+                let enabled = always_on_top.get();
+                webview.evaluate_script(&format!(
+                    "window.__pinReport && window.__pinReport({});",
+                    if enabled { "true" } else { "false" }
+                )).ok();
+            }
+            Event::UserEvent(WindowCommand::EnsureAlwaysOnTop) => {
+                if always_on_top.get() {
+                    apply_always_on_top(&window, true);
                 }
             }
             Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {

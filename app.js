@@ -21,6 +21,7 @@ const DEFAULT_SETTINGS = {
   glassOpacity: 0.82,
   glassEnabled: true,
   glassMigrated: false,
+  alwaysOnTop: false,
   chineseFont: "noto-sans",
   englishFont: "arial",
   followSystem: false,
@@ -102,6 +103,21 @@ let sidebarCollapsed = localStorage.getItem("cixu-sidebar") === "1";
 let databaseAvailable = false;
 let databaseSaveTimer;
 let databaseSaveQueue = Promise.resolve();
+// The shell only knows a window-level fact; ask it once at startup instead of
+// trusting the cached setting, because the window may be restored pinned from the
+// previous run while this copy of the page could be stale.
+function requestPinnedState() {
+  if (!isNativeShell()) return;
+  window.ipc?.postMessage("window:pin-query");
+}
+// A pinned window should still be pinned after a reload, so the saved setting is
+// pushed back to the shell on startup; the shell answers through __pinReport,
+// which keeps the button honest if it disagrees.
+function restorePinnedWindow() {
+  if (!isNativeShell() || !state.settings.alwaysOnTop) { renderShell(); return; }
+  window.ipc?.postMessage("window:pin-on");
+  renderShell();
+}
 function syncNativeGlass(enabled) {
   // Always push the state instead of trusting a cached flag: after the window is
   // recreated or DWM drops the effect, a stale "already synced" value would
@@ -515,7 +531,34 @@ function isNativeShell() {
 function applyNativeChrome() {
   if (isNativeShell()) document.body.dataset.native = "on";
   else delete document.body.dataset.native;
+  reflectPinnedWindow();
 }
+// The shell owns the real pin state: it survives a page reload and the window
+// manager can change it. The button therefore only mirrors what the shell last
+// reported through window.__pinReport, and pressing it sends a request.
+function reflectPinnedWindow() {
+  const button = document.querySelector('[data-action="pin-window"]');
+  if (!button) return;
+  const pinned = Boolean(state.settings.alwaysOnTop);
+  button.setAttribute("aria-pressed", pinned ? "true" : "false");
+  button.title = pinned ? "取消置顶" : "固定在其它窗口之上";
+  button.setAttribute("aria-label", button.title);
+}
+function togglePinWindow() {
+  if (!isNativeShell()) return toast("浏览器打开时无法置顶窗口");
+  state.settings.alwaysOnTop = !state.settings.alwaysOnTop;
+  window.ipc?.postMessage(state.settings.alwaysOnTop ? "window:pin-on" : "window:pin-off");
+  reflectPinnedWindow();
+  persist();
+  toast(state.settings.alwaysOnTop ? "窗口已置顶" : "已取消置顶");
+}
+// Called from Rust after every pin change, so the UI can never drift from the
+// window manager, for example when the pin is restored on startup.
+window.__pinReport = pinned => {
+  if (state.settings.alwaysOnTop === Boolean(pinned)) return;
+  state.settings.alwaysOnTop = Boolean(pinned);
+  reflectPinnedWindow();
+};
 function renderShell() {
   document.querySelectorAll(".nav-item").forEach(button => button.classList.toggle("active", button.dataset.view === currentView));
   document.getElementById("review-nav-count").textContent = allDue();
@@ -1954,6 +1997,8 @@ document.addEventListener("click", event => {
   // "drag" is driven from mousedown (see the listener above); re-sending it on
   // click would ask the shell to start a drag after the button was released.
   if (windowCommand && windowCommand !== "drag") window.ipc?.postMessage(`window:${windowCommand}`);
+  const pinButton = event.target.closest('[data-action="pin-window"]');
+  if (pinButton) { event.preventDefault(); togglePinWindow(); return; }
   const scopeField = event.target.closest("[data-scope]");
   if (scopeField && !event.target.closest("[data-step]")) return;
   if (event.target.closest("#sidebar-toggle")) {
@@ -2276,7 +2321,8 @@ window.addEventListener("resize", () => {
 applyTheme();
 applySidebar();
 applyNativeChrome();
-renderShell();
+requestPinnedState();
+restorePinnedWindow();
 loadDatabaseState().then(() => {
   loadIeltsBook();
   loadListeningData();
