@@ -48,12 +48,16 @@ body[data-native] .window-bar{display:flex;position:fixed;top:0;right:0;left:0;h
 /* Pin sits next to the grip, so the two window-level controls stay together on
    the left while minimise/maximise/close stay on the right. */
 .window-bar-start{display:flex;pointer-events:auto}
-.window-pin{width:30px;height:30px;border:0;background:transparent;color:var(--muted);font-size:11px;line-height:1;display:grid;place-items:center;cursor:pointer;opacity:0;transition:opacity .15s,background .12s,color .12s}
+.window-pin{width:26px;height:30px;border:0;background:transparent;color:var(--muted);display:grid;place-items:center;cursor:pointer;opacity:0;transition:opacity .15s,background .12s,color .12s}
 .window-bar:hover .window-pin{opacity:.85}
 .window-pin:hover{background:var(--surface-2);color:var(--text)}
-/* The pin has to stay visible once it is armed: it is the only way to release it,
-   and an invisible control would leave the window pinned for good. */
-.window-pin[aria-pressed="true"]{opacity:1;color:var(--accent);transform:rotate(-20deg)}
+.window-pin svg{width:12px;height:12px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round;transition:fill .12s}
+/* Pinned stays permanently visible, because the button is the only way to release
+   a window that has already been dropped from the taskbar. No colour, no tilt:
+   the filled outline is the whole signal, and it sits in the same grey as its
+   neighbours. */
+.window-pin[aria-pressed="true"]{opacity:.9}
+.window-pin[aria-pressed="true"] svg{fill:currentColor}
 .window-bar-actions{display:flex;pointer-events:auto}
 .window-button{width:44px;height:30px;border:0;background:transparent;color:var(--muted);font-size:13px;line-height:1;display:grid;place-items:center;transition:background .12s,color .12s}
 .window-button:hover{background:var(--surface-2);color:var(--text)}
