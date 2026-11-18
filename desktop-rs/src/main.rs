@@ -624,6 +624,13 @@ fn default_window_size<T: 'static>(event_loop: &EventLoop<T>) -> PhysicalSize<u3
 /// could still end up stranded behind a maximised window with no way back.
 /// Applying `TOPMOST` on every pass re-raises the window and makes it visible
 /// again, which is exactly what the pin promises.
+///
+/// `WS_EX_NOACTIVATE` deliberately is not part of this. It keeps a window from
+/// being activated at all, which also stops Windows handing it keyboard focus:
+/// with it set the page never receives key events, so the 1-4 and arrow
+/// shortcuts went dead whenever the window was pinned. Staying on top does not
+/// need it - `TOPMOST` plus the re-raise poll is enough - and the focused window
+/// is supposed to keep its shortcuts.
 fn apply_always_on_top(window: &tao::window::Window, always_on_top: bool) {
     window.set_always_on_top(always_on_top);
     #[cfg(windows)]
@@ -631,15 +638,33 @@ fn apply_always_on_top(window: &tao::window::Window, always_on_top: bool) {
         let hwnd = HWND(window.hwnd() as *mut _);
         let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
         let next = if always_on_top {
-            // Pinned: keep the window out of the taskbar and out of the
-            // alt-tab list, and never steal focus when it re-raises itself.
-            style | WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0
+            // Pinned: keep the window out of the taskbar and out of the alt-tab
+            // list. Activation stays allowed so the keyboard keeps working.
+            style | WS_EX_TOOLWINDOW.0
         } else {
             // Unpinned: give the window its taskbar button back. Only the bits
             // this function owns are cleared, everything else is left alone.
-            style & !(WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0)
+            style & !(WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0)
         };
         if next != style {
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next as isize);
+        }
+    }
+}
+
+/// Keep activation available on a pinned window.
+///
+/// Windows ORs `WS_EX_NOACTIVATE` in on its own when `WS_EX_TOOLWINDOW` is
+/// applied to a window that already exists, which would leave the page without
+/// keyboard focus and kill the 1-4 / arrow shortcuts while pinned. Writing the
+/// style once is therefore not enough: read it back and drop the bit again.
+#[cfg(windows)]
+fn keep_window_activatable(window: &tao::window::Window) {
+    unsafe {
+        let hwnd = HWND(window.hwnd() as *mut _);
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        if style & WS_EX_NOACTIVATE.0 != 0 {
+            let next = style & !WS_EX_NOACTIVATE.0;
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next as isize);
         }
     }
@@ -824,6 +849,7 @@ fn main() -> wry::Result<()> {
             Event::UserEvent(WindowCommand::SetAlwaysOnTop(enabled)) => {
                 always_on_top.set(enabled);
                 apply_always_on_top(&window, enabled);
+                keep_window_activatable(&window);
                 log(&format!("window pin enabled={enabled}"));
                 webview.evaluate_script(&format!(
                     "window.__pinReport && window.__pinReport({});",
@@ -840,6 +866,7 @@ fn main() -> wry::Result<()> {
             Event::UserEvent(WindowCommand::EnsureAlwaysOnTop) => {
                 if always_on_top.get() {
                     apply_always_on_top(&window, true);
+                    keep_window_activatable(&window);
                 }
             }
             Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
